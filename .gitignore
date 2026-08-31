@@ -1,0 +1,7 @@
+.DS_Store
+Thumbs.db
+*.log
+.codex-token-dashboard.pid
+.cache/
+node_modules/
+CodexTokenWidget.ci.exe

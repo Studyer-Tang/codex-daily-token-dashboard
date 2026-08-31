@@ -1,0 +1,17 @@
+{
+  "name": "codex-daily-token-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A privacy-first Windows floating widget for daily Codex token usage.",
+  "type": "module",
+  "scripts": {
+    "build:widget": "build-widget.cmd",
+    "start": "node server.mjs",
+    "widget": "CodexTokenWidget.exe",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

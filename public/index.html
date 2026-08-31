@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Codex Token 日历</title>
+    <link rel="icon" href="/icon.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <main class="dashboard">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark"><span></span><span></span><span></span></div>
+          <div>
+            <p class="eyebrow">LOCAL CODEX ANALYTICS</p>
+            <h1>Token 日历</h1>
+          </div>
+        </div>
+        <div class="actions">
+          <div class="range-switch" aria-label="统计范围">
+            <button data-days="14">14 天</button>
+            <button data-days="30" class="active">30 天</button>
+            <button data-days="90">90 天</button>
+          </div>
+          <button id="refresh" class="refresh" aria-label="刷新数据">↻ <span>刷新</span></button>
+        </div>
+      </header>
+
+      <section class="hero-grid">
+        <article class="today-card panel">
+          <div class="card-label"><span class="live-dot"></span>今日用量</div>
+          <div class="today-value" id="today-value">—</div>
+          <div class="today-meta">
+            <span id="today-date">正在读取本地日志</span>
+            <span id="today-change" class="change neutral">—</span>
+          </div>
+          <div class="sparkline" id="sparkline"></div>
+        </article>
+
+        <article class="summary-card panel">
+          <div class="card-label">近 7 天</div>
+          <strong id="week-value">—</strong>
+          <span id="week-average">日均 —</span>
+        </article>
+        <article class="summary-card panel">
+          <div class="card-label">近 30 天</div>
+          <strong id="month-value">—</strong>
+          <span id="active-days">活跃 — 天</span>
+        </article>
+        <article class="summary-card privacy-card panel">
+          <div class="privacy-icon">⌂</div>
+          <div>
+            <div class="card-label">隐私状态</div>
+            <strong>仅在本机</strong>
+            <span>无需 API Key · 不上传日志</span>
+          </div>
+        </article>
+      </section>
+
+      <section class="main-grid">
+        <article class="trend-card panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">DAILY TREND</p>
+              <h2>每日 Token 趋势</h2>
+            </div>
+            <div class="legend"><span></span>总 Token</div>
+          </div>
+          <div id="trend-chart" class="trend-chart" aria-label="每日 Token 趋势图"></div>
+        </article>
+
+        <article class="breakdown-card panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">TODAY'S MIX</p>
+              <h2>今日构成</h2>
+            </div>
+          </div>
+          <div id="donut" class="donut"><div><strong>—</strong><span>总计</span></div></div>
+          <div class="breakdown-list">
+            <div><span class="swatch uncached"></span><label>非缓存输入</label><strong id="uncached-value">—</strong></div>
+            <div><span class="swatch cached"></span><label>缓存输入</label><strong id="cached-value">—</strong></div>
+            <div><span class="swatch output"></span><label>输出</label><strong id="output-value">—</strong></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="lower-grid">
+        <article class="heatmap-card panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">ACTIVITY</p>
+              <h2>Token 活跃热力图</h2>
+            </div>
+            <span id="streak" class="streak">连续 0 天</span>
+          </div>
+          <div id="heatmap" class="heatmap"></div>
+          <div class="heat-legend"><span>少</span><i></i><i></i><i></i><i></i><i></i><span>多</span></div>
+        </article>
+
+        <article class="recent-card panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">RECENT DAYS</p>
+              <h2>最近记录</h2>
+            </div>
+          </div>
+          <div id="recent-list" class="recent-list"></div>
+        </article>
+      </section>
+
+      <footer>
+        <span id="status"><i></i>正在初始化</span>
+        <span id="diagnostics"></span>
+      </footer>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
