@@ -3,7 +3,21 @@ import { mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { collectUsage, normalizeUsage } from "../src/usage.mjs";
+import { collectUsage, groupTasksByRoot, normalizeUsage } from "../src/usage.mjs";
+
+test("groups subagent usage under its root user task", () => {
+  const tasks = new Map([
+    ["root.jsonl", { sessionKey: "root.jsonl", title: "", turns: [{ usage: { totalTokens: 10 } }] }],
+    ["child.jsonl", { sessionKey: "child.jsonl", title: "child", turns: [{ usage: { totalTokens: 20 } }] }],
+  ]);
+  groupTasksByRoot(tasks, {
+    titles: new Map([["root.jsonl", "用户任务"]]),
+    roots: new Map([["root.jsonl", "root.jsonl"], ["child.jsonl", "root.jsonl"]]),
+  });
+  assert.equal(tasks.size, 1);
+  assert.equal(tasks.get("root.jsonl").title, "用户任务");
+  assert.equal(tasks.get("root.jsonl").turns.length, 2);
+});
 
 test("normalizes Codex usage without double-counting cached input", () => {
   assert.deepEqual(normalizeUsage({

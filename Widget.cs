@@ -33,7 +33,7 @@ internal static class Program
     }
 }
 
-internal sealed class TokenWidgetForm : Form
+internal sealed partial class TokenWidgetForm : Form
 {
     private const int Port = 4817;
     private readonly Color bg = Color.FromArgb(20, 22, 24);
@@ -90,35 +90,6 @@ internal sealed class TokenWidgetForm : Form
         "widget.log"
     );
 
-    private sealed class UsageTask
-    {
-        public string Id = "";
-        public string Label = "匿名任务";
-        public string Title = "";
-        public string LastActivity = "";
-        public double TotalTokens;
-        public double InputTokens;
-        public double CachedInputTokens;
-        public double OutputTokens;
-        public int TurnCount;
-        public bool DetailsLoaded;
-        public bool DetailsLoading;
-        public string DetailError = "";
-        public List<UsageTurn> Turns = new List<UsageTurn>();
-    }
-
-    private sealed class UsageTurn
-    {
-        public int Number;
-        public string Timestamp = "";
-        public bool Identified;
-        public string Prompt = "";
-        public double TotalTokens;
-        public double InputTokens;
-        public double CachedInputTokens;
-        public double OutputTokens;
-    }
-
     [DllImport("user32.dll")]
     private static extern bool ReleaseCapture();
 
@@ -140,6 +111,7 @@ internal sealed class TokenWidgetForm : Form
         var work = Screen.PrimaryScreen.WorkingArea;
         Location = new Point(work.Right - Width - 24, work.Top + 24);
         UpdateWindowRegion();
+        InitializeTaskSearch();
 
         var menu = new ContextMenuStrip();
         var showItem = menu.Items.Add("显示悬浮窗");
@@ -198,6 +170,7 @@ internal sealed class TokenWidgetForm : Form
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
+        SyncTaskSearchVisibility();
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
@@ -404,13 +377,13 @@ internal sealed class TokenWidgetForm : Form
 
     private void DrawTaskList(Graphics g)
     {
-        Draw(g, "任务用量排行", 18, 68, 10.5f, text, FontStyle.Bold);
+        Draw(g, String.IsNullOrWhiteSpace(TaskSearchQuery) ? "任务用量排行" : "搜索结果", 18, 68, 10.5f, text, FontStyle.Bold);
         var totalTurns = 0;
         foreach (var task in usageTasks) totalTurns += task.TurnCount;
-        Draw(g, usageTasks.Count + " 个任务 · " + totalTurns + " 轮", 18, 91, 7, tertiary);
+        Draw(g, usageTasks.Count + " 个任务 · " + totalTurns + " 轮", 18, 96, 7, tertiary);
         var visible = 7;
         var end = Math.Min(usageTasks.Count, taskScroll + visible);
-        DrawRight(g, usageTasks.Count > visible ? (taskScroll + 1) + "–" + end + " / " + usageTasks.Count + " · 滚轮浏览" : "点击查看每轮明细", 364, 91, 6.2f, tertiary);
+        DrawRight(g, usageTasks.Count > visible ? (taskScroll + 1) + "–" + end + " / " + usageTasks.Count + " · 滚轮浏览" : "点击查看每轮明细", 364, 96, 6.2f, tertiary);
         if (!dataReady)
         {
             DrawCentered(g, "正在读取本地任务记录", new Font("Microsoft YaHei UI", 8), secondary, new Rectangle(18, 190, 346, 80));
@@ -428,7 +401,7 @@ internal sealed class TokenWidgetForm : Form
             var index = taskScroll + slot;
             if (index >= usageTasks.Count) break;
             var task = usageTasks[index];
-            var rect = new Rectangle(18, 116 + slot * 58, 346, 52);
+            var rect = new Rectangle(18, 121 + slot * 56, 346, 50);
             FillRound(g, rect, 11, surface);
             using (var p = new Pen(border)) using (var path = Rounded(rect, 11)) g.DrawPath(p, path);
             DrawCentered(g, (index + 1).ToString("00"), new Font("Segoe UI", 6.5f), tertiary, new Rectangle(rect.X + 4, rect.Y, 28, rect.Height));
@@ -559,12 +532,12 @@ internal sealed class TokenWidgetForm : Form
                     return;
                 }
             }
-            else if (e.Y >= 116 && e.Y < 522)
+            else if (e.Y >= 121 && e.Y < 513)
             {
-                var slot = (e.Y - 116) / 58;
+                var slot = (e.Y - 121) / 56;
                 var index = taskScroll + slot;
-                var rowTop = 116 + slot * 58;
-                if (slot >= 0 && slot < 7 && index < usageTasks.Count && new Rectangle(18, rowTop, 346, 52).Contains(e.Location))
+                var rowTop = 121 + slot * 56;
+                if (slot >= 0 && slot < 7 && index < usageTasks.Count && new Rectangle(18, rowTop, 346, 50).Contains(e.Location))
                 {
                     selectedTaskIndex = index;
                     turnScroll = 0;
@@ -585,7 +558,7 @@ internal sealed class TokenWidgetForm : Form
                 (FocusedTask() != null && new Rectangle(4, 4, 94, 60).Contains(e.Location)) ||
                 (compactTaskMode && new Rectangle(100, 6, 110, 30).Contains(e.Location))
             : new Rectangle(165, 17, 203, 28).Contains(e.Location) || new Rectangle(310, 521, 54, 25).Contains(e.Location) ||
-                (taskView && selectedTaskIndex < 0 && e.Y >= 116 && e.Y < 522) ||
+                (taskView && selectedTaskIndex < 0 && e.Y >= 121 && e.Y < 513) ||
                 (taskView && selectedTaskIndex >= 0 && (new Rectangle(18, 67, 34, 25).Contains(e.Location) || new Rectangle(286, 67, 78, 25).Contains(e.Location)));
         Cursor = active ? Cursors.Hand : (e.Y < 58 ? Cursors.SizeAll : Cursors.Default);
     }
@@ -836,7 +809,8 @@ internal sealed class TokenWidgetForm : Form
                 BeginRecovery(detail);
             }
         };
-        client.DownloadStringAsync(new Uri("http://127.0.0.1:" + Port + "/api/usage?days=30&taskDetail=summary"));
+        var url = "http://127.0.0.1:" + Port + "/api/usage?days=30&taskDetail=summary" + TaskSearchParameter();
+        client.DownloadStringAsync(new Uri(url));
     }
 
     private void RequestTaskDetails(UsageTask task)

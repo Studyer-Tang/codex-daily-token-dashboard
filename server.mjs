@@ -32,18 +32,27 @@ function safeErrorDetail(error) {
   return message.length > 240 ? `${message.slice(0, 239)}…` : message;
 }
 
-export function selectUsageDetails(usage, { taskDetail = "full", taskId = "" } = {}) {
+function taskMatchesQuery(task, query) {
+  const terms = String(query || "").trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const prompts = Array.isArray(task?.turns) ? task.turns.map((turn) => turn?.prompt || "") : [];
+  const searchable = [task?.id, task?.label, task?.title, ...prompts].join(" ").toLocaleLowerCase();
+  return terms.every((term) => searchable.includes(term));
+}
+
+export function selectUsageDetails(usage, { taskDetail = "full", taskId = "", query = "" } = {}) {
   if (!Array.isArray(usage?.tasks)) return usage;
   if (taskId) {
     return { ...usage, tasks: usage.tasks.filter((task) => task.id === taskId) };
   }
+  const tasks = query ? usage.tasks.filter((task) => taskMatchesQuery(task, query)) : usage.tasks;
   if (taskDetail === "summary") {
     return {
       ...usage,
-      tasks: usage.tasks.map(({ turns = [], ...task }) => ({ ...task, turnCount: turns.length })),
+      tasks: tasks.map(({ turns = [], ...task }) => ({ ...task, turnCount: turns.length })),
     };
   }
-  return usage;
+  return tasks === usage.tasks ? usage : { ...usage, tasks };
 }
 
 export class UsageWorkerClient {
@@ -145,6 +154,7 @@ export function createDashboardServer({
         return sendJson(response, 200, selectUsageDetails(usage, {
           taskDetail: url.searchParams.get("taskDetail") || "full",
           taskId: url.searchParams.get("task") || "",
+          query: (url.searchParams.get("query") || "").slice(0, 80),
         }));
       }
       const asset = staticFiles.get(url.pathname);

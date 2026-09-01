@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.0 - 2026-09-01
+
+- Grouped internal subagent usage under its root user task instead of showing hundreds of repeated task rows.
+- Added native keyword search across task titles and privacy-filtered user prompt excerpts.
+- Added debounced local search with Enter-to-search and Escape-to-clear keyboard controls.
+- Split native task models and search behavior into focused source modules.
+- Added a self-contained Windows quick-start file; the packaged widget needs no Node.js, address, port, or configuration file.
+
 ## 1.4.0 - 2026-09-01
 
 - Added saved Codex task titles beside anonymous task numbers when available.

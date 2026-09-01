@@ -1,0 +1,14 @@
+Codex Token Widget / 使用说明
+================================
+
+1. 解压整个 CodexTokenWidget 文件夹。
+2. 双击 CodexTokenWidget.exe。
+3. 完成。无需安装 Node.js，无需填写地址、端口、账号或配置文件。
+
+任务搜索：展开小窗 -> 任务 -> 输入任务名或提示词关键词。
+切换小窗任务：打开搜索结果 -> 小窗关注 -> 点击“–”收起。
+
+所有数据只从本机 .codex 目录读取。退出请右键系统托盘图标并选择“退出”。
+
+English: Extract the whole folder and double-click CodexTokenWidget.exe.
+The package is self-contained and requires no server address or configuration.

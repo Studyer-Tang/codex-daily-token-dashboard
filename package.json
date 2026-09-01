@@ -1,6 +1,6 @@
 {
   "name": "codex-daily-token-dashboard",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "A privacy-first Windows floating widget for daily Codex token usage.",
   "type": "module",

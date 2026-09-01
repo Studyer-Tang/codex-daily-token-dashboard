@@ -9,3 +9,4 @@ CodexTokenWidget.exe
 dist/
 .release-staging/
 .tmp-package-test/
+.package-smoke/

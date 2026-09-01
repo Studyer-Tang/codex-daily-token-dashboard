@@ -43,8 +43,8 @@ test("returns task summaries without turn payloads and selects one task on deman
   const usage = {
     today: { totalTokens: 30 },
     tasks: [
-      { id: "task-a", label: "任务 A", totalTokens: 20, turns: [{ totalTokens: 20 }] },
-      { id: "task-b", label: "任务 B", totalTokens: 10, turns: [{ totalTokens: 4 }, { totalTokens: 6 }] },
+      { id: "task-a", label: "任务 A", title: "论文证据网络", totalTokens: 20, turns: [{ prompt: "检查 DOI 来源", totalTokens: 20 }] },
+      { id: "task-b", label: "任务 B", title: "桌面工具", totalTokens: 10, turns: [{ prompt: "优化窗口", totalTokens: 4 }, { totalTokens: 6 }] },
     ],
   };
   const summary = selectUsageDetails(usage, { taskDetail: "summary" });
@@ -52,6 +52,10 @@ test("returns task summaries without turn payloads and selects one task on deman
   assert.equal(summary.tasks[1].turnCount, 2);
   assert.equal("turns" in summary.tasks[0], false);
   assert.deepEqual(selectUsageDetails(usage, { taskId: "task-b" }).tasks, [usage.tasks[1]]);
+  const titleSearch = selectUsageDetails(usage, { taskDetail: "summary", query: "证据" });
+  assert.deepEqual(titleSearch.tasks.map((task) => task.id), ["task-a"]);
+  assert.equal("turns" in titleSearch.tasks[0], false);
+  assert.deepEqual(selectUsageDetails(usage, { taskDetail: "summary", query: "doi 来源" }).tasks.map((task) => task.id), ["task-a"]);
   assert.equal(usage.tasks[0].turns.length, 1);
 });
 

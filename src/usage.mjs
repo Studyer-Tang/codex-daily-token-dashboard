@@ -13,7 +13,7 @@ const fileCache = new Map();
 let ripgrepSnapshot = null;
 let snapshotRefresh = null;
 let snapshotLoaded = false;
-let threadTitleCache = { loadedAt: 0, titles: new Map() };
+let threadMetadataCache = { loadedAt: 0, titles: new Map(), roots: new Map() };
 function applicationCacheDirectory() {
   if (process.env.CODEX_TOKEN_CACHE_DIR) return path.resolve(process.env.CODEX_TOKEN_CACHE_DIR);
   if (process.platform === "win32" && process.env.LOCALAPPDATA) {
@@ -147,18 +147,39 @@ function mergePrompt(current, next) {
   return conciseText([current, next].filter(Boolean).join(" "));
 }
 
-async function loadThreadTitles() {
-  if (Date.now() - threadTitleCache.loadedAt < 60_000) return threadTitleCache.titles;
+async function loadThreadMetadata() {
+  if (Date.now() - threadMetadataCache.loadedAt < 60_000) return threadMetadataCache;
   const titles = new Map();
+  const roots = new Map();
   try {
     const { DatabaseSync } = await import("node:sqlite");
     const database = new DatabaseSync(path.join(os.homedir(), ".codex", "state_5.sqlite"), { readOnly: true });
     try {
-      const rows = database.prepare("SELECT rollout_path, name, title FROM threads WHERE rollout_path IS NOT NULL").all();
+      const rows = database.prepare("SELECT id, rollout_path, name, title, source, thread_source FROM threads WHERE rollout_path IS NOT NULL").all();
+      const sessionById = new Map(rows.map((row) => [String(row.id || ""), path.basename(String(row.rollout_path || "")).toLowerCase()]));
+      const parentBySession = new Map();
       for (const row of rows) {
         const sessionKey = path.basename(String(row.rollout_path || "")).toLowerCase();
         const title = taskTitle(row.name || row.title || "");
         if (sessionKey && title) titles.set(sessionKey, title);
+        if (row.thread_source !== "subagent" || !sessionKey) continue;
+        try {
+          const source = JSON.parse(String(row.source || "{}"));
+          const parentId = source?.subagent?.thread_spawn?.parent_thread_id;
+          const parentSession = sessionById.get(String(parentId || ""));
+          if (parentSession) parentBySession.set(sessionKey, parentSession);
+        } catch {
+          // Older records can use a non-JSON source label; leave them as standalone tasks.
+        }
+      }
+      for (const sessionKey of sessionById.values()) {
+        let root = sessionKey;
+        const visited = new Set();
+        while (parentBySession.has(root) && !visited.has(root)) {
+          visited.add(root);
+          root = parentBySession.get(root);
+        }
+        roots.set(sessionKey, root);
       }
     } finally {
       database.close();
@@ -166,13 +187,34 @@ async function loadThreadTitles() {
   } catch {
     // Node 20 and non-Codex environments may not expose node:sqlite or the state database.
   }
-  threadTitleCache = { loadedAt: Date.now(), titles };
-  return titles;
+  threadMetadataCache = { loadedAt: Date.now(), titles, roots };
+  return threadMetadataCache;
 }
 
-async function attachTaskTitles(tasks) {
-  const titles = await loadThreadTitles();
-  for (const task of tasks.values()) task.title = taskTitle(titles.get(task.sessionKey) || task.title || "");
+export function groupTasksByRoot(tasks, { titles = new Map(), roots = new Map() } = {}) {
+  const grouped = new Map();
+  for (const task of tasks.values()) {
+    const rootKey = roots.get(task.sessionKey) || task.sessionKey;
+    const existing = grouped.get(rootKey);
+    if (existing) {
+      existing.turns.push(...task.turns);
+      continue;
+    }
+    grouped.set(rootKey, {
+      ...task,
+      sessionKey: rootKey,
+      title: taskTitle(titles.get(rootKey) || task.title || ""),
+      turns: [...task.turns],
+    });
+  }
+  tasks.clear();
+  for (const [sessionKey, task] of grouped) tasks.set(sessionKey, task);
+  return tasks;
+}
+
+async function attachTaskMetadata(tasks) {
+  const metadata = await loadThreadMetadata();
+  groupTasksByRoot(tasks, metadata);
 }
 
 export function localDayKey(value) {
@@ -494,7 +536,7 @@ async function loadPersistedSnapshot() {
   for (const candidate of [snapshotPath, legacySnapshotPath]) {
     try {
       const raw = JSON.parse(await readFile(candidate, "utf8"));
-      if (raw.version !== 6 || !Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days) || !Array.isArray(raw.tasks)) continue;
+      if (raw.version !== 7 || !Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days) || !Array.isArray(raw.tasks)) continue;
       ripgrepSnapshot = {
         generatedAtMs: raw.generatedAtMs,
         buckets: new Map(raw.days.map((day) => [day.day, day])),
@@ -518,12 +560,12 @@ async function refreshRipgrepSnapshot(sourceRoots) {
   if (snapshotRefresh) return snapshotRefresh;
   snapshotRefresh = (async () => {
     const fresh = await scanWithRipgrep(sourceRoots);
-    await attachTaskTitles(fresh.tasks);
+    await attachTaskMetadata(fresh.tasks);
     ripgrepSnapshot = fresh;
     try {
       await mkdir(path.dirname(snapshotPath), { recursive: true });
       await writeFile(snapshotPath, JSON.stringify({
-        version: 6,
+        version: 7,
         generatedAtMs: fresh.generatedAtMs,
         days: [...fresh.buckets.values()],
         tasks: [...fresh.tasks.values()],
@@ -558,6 +600,25 @@ function anonymousTaskId(sessionKey) {
   return createHash("sha256").update(sessionKey).digest("hex").slice(0, 12);
 }
 
+function recentPromptTitle(turns) {
+  const candidates = turns.map((turn) => taskTitle(turn.prompt)).filter(Boolean).reverse();
+  return candidates.find((title) =>
+    title.length >= 8 && !/^(?:ok|okay|好|好的|行|可以|继续|完成|是的|没问题)[\s，。！!]*$/i.test(title)) || candidates[0] || "";
+}
+
+function resolveDuplicateTitles(tasks) {
+  const counts = new Map();
+  for (const task of tasks) {
+    const key = task.title.toLocaleLowerCase();
+    if (key) counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  for (const task of tasks) {
+    if ((counts.get(task.title.toLocaleLowerCase()) || 0) > 1 && task.recentTitle) task.title = task.recentTitle;
+    delete task.recentTitle;
+  }
+  return tasks;
+}
+
 function taskBreakdown(tasks, cutoffDay, today) {
   const result = [];
   for (const task of tasks.values()) {
@@ -572,6 +633,7 @@ function taskBreakdown(tasks, cutoffDay, today) {
       id,
       label: `任务 ${id.slice(0, 4).toUpperCase()}`,
       title: taskTitle(task.title) || taskTitle(fallbackTitle),
+      recentTitle: recentPromptTitle(turns),
       firstActivity: turns[0].timestamp,
       lastActivity: turns.at(-1).timestamp,
       ...usage,
@@ -584,7 +646,7 @@ function taskBreakdown(tasks, cutoffDay, today) {
       })),
     });
   }
-  return result.sort((left, right) =>
+  return resolveDuplicateTitles(result).sort((left, right) =>
     right.totalTokens - left.totalTokens || right.lastActivity.localeCompare(left.lastActivity));
 }
 
@@ -611,7 +673,7 @@ export async function collectUsage({ days = 30, roots, now = new Date() } = {}) 
       refreshRipgrepSnapshot(sourceRoots).catch(() => {});
     }
     if (ripgrepSnapshot) {
-      await attachTaskTitles(ripgrepSnapshot.tasks || new Map());
+      await attachTaskMetadata(ripgrepSnapshot.tasks || new Map());
       const timeline = [];
       for (let index = 0; index < range; index += 1) {
         const day = shiftDay(cutoffDay, index);
@@ -688,7 +750,7 @@ export async function collectUsage({ days = 30, roots, now = new Date() } = {}) 
   const last7 = summarize(timeline.slice(-7));
   const last30 = summarize(timeline.slice(-30));
   const total = summarize(timeline);
-  if (!roots) await attachTaskTitles(tasks);
+  if (!roots) await attachTaskMetadata(tasks);
 
   return {
     generatedAt: new Date().toISOString(),

@@ -24,8 +24,8 @@ try {
     New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-    Copy-Item -LiteralPath "CodexTokenWidget.exe", "server.mjs", "README.md", "CHANGELOG.md", "LICENSE", "start-dashboard.cmd", "stop-dashboard.cmd" -Destination $packageRoot
-    Copy-Item -LiteralPath "src", "public" -Destination $packageRoot -Recurse
+    Copy-Item -LiteralPath "CodexTokenWidget.exe", "server.mjs", "START-HERE.txt", "README.md", "CHANGELOG.md", "LICENSE", "start-dashboard.cmd", "stop-dashboard.cmd" -Destination $packageRoot
+    Copy-Item -LiteralPath "src", "public", "widget" -Destination $packageRoot -Recurse
 
     if ($IncludeBundledNode) {
         $nodeCommand = Get-Command node.exe -ErrorAction Stop
@@ -37,7 +37,16 @@ try {
     $zipPath = Join-Path $outputRoot "CodexTokenWidget-windows-x64.zip"
     if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
     Compress-Archive -Path $packageRoot -DestinationPath $zipPath -CompressionLevel Optimal
-    $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($zipPath)
+    try {
+        $hashBytes = $sha256.ComputeHash($stream)
+        $hash = -join ($hashBytes | ForEach-Object { $_.ToString("x2") })
+    }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
     $checksumPath = Join-Path $outputRoot "CodexTokenWidget-windows-x64.sha256.txt"
     Set-Content -LiteralPath $checksumPath -Value "$hash  CodexTokenWidget-windows-x64.zip" -Encoding ascii
     Write-Output $zipPath
