@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1 - 2026-09-01
+
+- Use `session_index.jsonl` task names so native rows exactly match the chat names shown in the Codex project sidebar.
+- Keep prompt-derived titles only as a compatibility fallback for older Codex records without an indexed name.
+
 ## 1.5.0 - 2026-09-01
 
 - Grouped internal subagent usage under its root user task instead of showing hundreds of repeated task rows.

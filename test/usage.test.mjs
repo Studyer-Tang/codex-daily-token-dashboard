@@ -3,7 +3,18 @@ import { mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { collectUsage, groupTasksByRoot, normalizeUsage } from "../src/usage.mjs";
+import { collectUsage, groupTasksByRoot, normalizeUsage, parseSessionNames } from "../src/usage.mjs";
+
+test("reads the same task names shown in the Codex project sidebar", () => {
+  const names = parseSessionNames([
+    JSON.stringify({ id: "thread-a", thread_name: "规划手写笔记转换项目" }),
+    "partially-written-row",
+    JSON.stringify({ id: "thread-b", thread_name: "检查断网重连五次" }),
+  ].join("\n"));
+  assert.equal(names.get("thread-a"), "规划手写笔记转换项目");
+  assert.equal(names.get("thread-b"), "检查断网重连五次");
+  assert.equal(names.size, 2);
+});
 
 test("groups subagent usage under its root user task", () => {
   const tasks = new Map([

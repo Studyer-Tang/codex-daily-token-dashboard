@@ -152,6 +152,12 @@ async function loadThreadMetadata() {
   const titles = new Map();
   const roots = new Map();
   try {
+    let indexedNames = new Map();
+    try {
+      indexedNames = parseSessionNames(await readFile(path.join(os.homedir(), ".codex", "session_index.jsonl"), "utf8"));
+    } catch {
+      // Older Codex versions may not have a session index.
+    }
     const { DatabaseSync } = await import("node:sqlite");
     const database = new DatabaseSync(path.join(os.homedir(), ".codex", "state_5.sqlite"), { readOnly: true });
     try {
@@ -160,7 +166,7 @@ async function loadThreadMetadata() {
       const parentBySession = new Map();
       for (const row of rows) {
         const sessionKey = path.basename(String(row.rollout_path || "")).toLowerCase();
-        const title = taskTitle(row.name || row.title || "");
+        const title = taskTitle(indexedNames.get(String(row.id || "")) || row.name || row.title || "");
         if (sessionKey && title) titles.set(sessionKey, title);
         if (row.thread_source !== "subagent" || !sessionKey) continue;
         try {
@@ -189,6 +195,22 @@ async function loadThreadMetadata() {
   }
   threadMetadataCache = { loadedAt: Date.now(), titles, roots };
   return threadMetadataCache;
+}
+
+export function parseSessionNames(content) {
+  const names = new Map();
+  for (const line of String(content || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const row = JSON.parse(line);
+      const id = String(row?.id || "");
+      const name = taskTitle(row?.thread_name || "");
+      if (id && name) names.set(id, name);
+    } catch {
+      // Ignore a partially written or legacy index row.
+    }
+  }
+  return names;
 }
 
 export function groupTasksByRoot(tasks, { titles = new Map(), roots = new Map() } = {}) {
@@ -600,25 +622,6 @@ function anonymousTaskId(sessionKey) {
   return createHash("sha256").update(sessionKey).digest("hex").slice(0, 12);
 }
 
-function recentPromptTitle(turns) {
-  const candidates = turns.map((turn) => taskTitle(turn.prompt)).filter(Boolean).reverse();
-  return candidates.find((title) =>
-    title.length >= 8 && !/^(?:ok|okay|好|好的|行|可以|继续|完成|是的|没问题)[\s，。！!]*$/i.test(title)) || candidates[0] || "";
-}
-
-function resolveDuplicateTitles(tasks) {
-  const counts = new Map();
-  for (const task of tasks) {
-    const key = task.title.toLocaleLowerCase();
-    if (key) counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  for (const task of tasks) {
-    if ((counts.get(task.title.toLocaleLowerCase()) || 0) > 1 && task.recentTitle) task.title = task.recentTitle;
-    delete task.recentTitle;
-  }
-  return tasks;
-}
-
 function taskBreakdown(tasks, cutoffDay, today) {
   const result = [];
   for (const task of tasks.values()) {
@@ -633,7 +636,6 @@ function taskBreakdown(tasks, cutoffDay, today) {
       id,
       label: `任务 ${id.slice(0, 4).toUpperCase()}`,
       title: taskTitle(task.title) || taskTitle(fallbackTitle),
-      recentTitle: recentPromptTitle(turns),
       firstActivity: turns[0].timestamp,
       lastActivity: turns.at(-1).timestamp,
       ...usage,
@@ -646,7 +648,7 @@ function taskBreakdown(tasks, cutoffDay, today) {
       })),
     });
   }
-  return resolveDuplicateTitles(result).sort((left, right) =>
+  return result.sort((left, right) =>
     right.totalTokens - left.totalTokens || right.lastActivity.localeCompare(left.lastActivity));
 }
 
