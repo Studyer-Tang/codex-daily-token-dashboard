@@ -5,6 +5,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -35,7 +36,8 @@ internal static class Program
 
 internal sealed partial class TokenWidgetForm : Form
 {
-    private const int Port = 4817;
+    private const int DefaultPort = 4817;
+    private int servicePort = DefaultPort;
     private readonly Color bg = Color.FromArgb(20, 22, 24);
     private readonly Color surface = Color.FromArgb(27, 30, 33);
     private readonly Color surfaceHigh = Color.FromArgb(35, 38, 42);
@@ -632,6 +634,7 @@ internal sealed partial class TokenWidgetForm : Form
                 ownedServer.Dispose();
                 ownedServer = null;
             }
+            SelectServicePort();
             var root = AppDomain.CurrentDomain.BaseDirectory;
             var bundledNode = Path.Combine(root, "runtime", "node.exe");
             var startInfo = new ProcessStartInfo
@@ -648,6 +651,7 @@ internal sealed partial class TokenWidgetForm : Form
                 StandardErrorEncoding = Encoding.UTF8
             };
             startInfo.EnvironmentVariables["CODEX_TOKEN_PARENT_PID"] = Process.GetCurrentProcess().Id.ToString();
+            startInfo.EnvironmentVariables["CODEX_TOKEN_PORT"] = servicePort.ToString();
             var serverProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             ownedServer = serverProcess;
             serverProcess.OutputDataReceived += delegate(object sender, DataReceivedEventArgs args)
@@ -669,7 +673,7 @@ internal sealed partial class TokenWidgetForm : Form
             if (!serverProcess.Start()) throw new InvalidOperationException("Node.js 进程未能启动");
             serverProcess.BeginOutputReadLine();
             serverProcess.BeginErrorReadLine();
-            Log("INFO", "已启动本地统计服务，pid=" + serverProcess.Id);
+            Log("INFO", "已启动本地统计服务，pid=" + serverProcess.Id + "，port=" + servicePort);
             return true;
         }
         catch (Exception error)
@@ -757,11 +761,39 @@ internal sealed partial class TokenWidgetForm : Form
         ownedServer = null;
     }
 
-    private bool ServiceHealthy()
+    private void SelectServicePort()
+    {
+        for (var candidate = DefaultPort; candidate <= DefaultPort + 10; candidate++)
+        {
+            if (ServiceHealthy(candidate) || PortAvailable(candidate))
+            {
+                servicePort = candidate;
+                return;
+            }
+        }
+        throw new InvalidOperationException("没有可用的本地统计端口");
+    }
+
+    private static bool PortAvailable(int port)
+    {
+        TcpListener listener = null;
+        try
+        {
+            listener = new TcpListener(IPAddress.Loopback, port);
+            listener.Start();
+            return true;
+        }
+        catch { return false; }
+        finally { if (listener != null) try { listener.Stop(); } catch { } }
+    }
+
+    private bool ServiceHealthy() { return ServiceHealthy(servicePort); }
+
+    private static bool ServiceHealthy(int port)
     {
         try
         {
-            var request = WebRequest.Create("http://127.0.0.1:" + Port + "/api/health");
+            var request = WebRequest.Create("http://127.0.0.1:" + port + "/api/health");
             request.Timeout = 1500;
             using (var response = request.GetResponse())
             using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
@@ -809,7 +841,7 @@ internal sealed partial class TokenWidgetForm : Form
                 BeginRecovery(detail);
             }
         };
-        var url = "http://127.0.0.1:" + Port + "/api/usage?days=30&taskDetail=summary" + TaskSearchParameter();
+        var url = "http://127.0.0.1:" + servicePort + "/api/usage?days=30&taskDetail=summary" + TaskSearchParameter();
         client.DownloadStringAsync(new Uri(url));
     }
 
@@ -872,7 +904,7 @@ internal sealed partial class TokenWidgetForm : Form
             }
             Invalidate();
         };
-        var url = "http://127.0.0.1:" + Port + "/api/usage?days=30&task=" + Uri.EscapeDataString(task.Id);
+        var url = "http://127.0.0.1:" + servicePort + "/api/usage?days=30&task=" + Uri.EscapeDataString(task.Id);
         client.DownloadStringAsync(new Uri(url));
     }
 

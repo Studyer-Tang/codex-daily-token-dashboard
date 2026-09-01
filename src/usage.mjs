@@ -23,6 +23,11 @@ function applicationCacheDirectory() {
   return path.join(os.homedir(), ".cache", "codex-token-widget");
 }
 
+export function codexDataDirectory({ environment = process.env, home = os.homedir() } = {}) {
+  const configured = String(environment.CODEX_HOME || "").trim();
+  return configured ? path.resolve(configured) : path.join(home, ".codex");
+}
+
 const snapshotPath = path.join(applicationCacheDirectory(), "usage-summary.json");
 const legacySnapshotPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -151,15 +156,16 @@ async function loadThreadMetadata() {
   if (Date.now() - threadMetadataCache.loadedAt < 60_000) return threadMetadataCache;
   const titles = new Map();
   const roots = new Map();
+  const codexRoot = codexDataDirectory();
   try {
     let indexedNames = new Map();
     try {
-      indexedNames = parseSessionNames(await readFile(path.join(os.homedir(), ".codex", "session_index.jsonl"), "utf8"));
+      indexedNames = parseSessionNames(await readFile(path.join(codexRoot, "session_index.jsonl"), "utf8"));
     } catch {
       // Older Codex versions may not have a session index.
     }
     const { DatabaseSync } = await import("node:sqlite");
-    const database = new DatabaseSync(path.join(os.homedir(), ".codex", "state_5.sqlite"), { readOnly: true });
+    const database = new DatabaseSync(path.join(codexRoot, "state_5.sqlite"), { readOnly: true });
     try {
       const rows = database.prepare("SELECT id, rollout_path, name, title, source, thread_source FROM threads WHERE rollout_path IS NOT NULL").all();
       const sessionById = new Map(rows.map((row) => [String(row.id || ""), path.basename(String(row.rollout_path || "")).toLowerCase()]));
@@ -656,7 +662,7 @@ export async function collectUsage({ days = 30, roots, now = new Date() } = {}) 
   const range = Math.max(7, Math.min(365, Number(days) || 30));
   const today = localDayKey(now);
   const cutoffDay = shiftDay(today, -(range - 1));
-  const codexRoot = path.join(os.homedir(), ".codex");
+  const codexRoot = codexDataDirectory();
   const sourceRoots = roots || [
     path.join(codexRoot, "sessions"),
     path.join(codexRoot, "archived_sessions"),

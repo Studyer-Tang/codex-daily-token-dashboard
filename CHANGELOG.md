@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.2 - 2026-09-01
+
+- Discover Codex records from `CODEX_HOME` when configured, otherwise from the current user's profile.
+- Let the native widget automatically choose a free loopback port when the default port is occupied.
+- Added portability coverage for alternate Windows user profiles and custom Codex data directories.
+
 ## 1.5.1 - 2026-09-01
 
 - Use `session_index.jsonl` task names so native rows exactly match the chat names shown in the Codex project sidebar.

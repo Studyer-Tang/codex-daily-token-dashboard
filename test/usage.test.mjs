@@ -3,7 +3,12 @@ import { mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { collectUsage, groupTasksByRoot, normalizeUsage, parseSessionNames } from "../src/usage.mjs";
+import { codexDataDirectory, collectUsage, groupTasksByRoot, normalizeUsage, parseSessionNames } from "../src/usage.mjs";
+
+test("discovers the default or configured Codex data directory without a user-specific path", () => {
+  assert.equal(codexDataDirectory({ environment: {}, home: path.join("C:", "Users", "another-user") }), path.join("C:", "Users", "another-user", ".codex"));
+  assert.equal(codexDataDirectory({ environment: { CODEX_HOME: path.join("D:", "CodexData") }, home: "ignored" }), path.resolve("D:", "CodexData"));
+});
 
 test("reads the same task names shown in the Codex project sidebar", () => {
   const names = parseSessionNames([
