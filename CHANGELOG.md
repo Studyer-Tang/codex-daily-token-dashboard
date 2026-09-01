@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.0 - 2026-09-01
+
+- Added privacy-preserving usage totals for each task and conversation turn.
+- Grouped modern `token_count` events using `task_started` and `task_complete` boundaries while retaining legacy-log compatibility.
+- Added expandable task rankings with input, cached input, output, totals, and high-usage markers.
+- Rendered large task and turn lists in batches to keep long histories responsive.
+- Kept raw session IDs, turn IDs, paths, prompts, and responses out of the browser payload.
+
 ## 1.1.0 - 2026-09-01
 
 - Isolated large Codex log scans in a worker so health checks remain responsive.

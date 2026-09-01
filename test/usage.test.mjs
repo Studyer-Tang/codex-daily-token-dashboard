@@ -56,6 +56,69 @@ test("aggregates last_token_usage by local day and deduplicates turn ids", async
     assert.equal(usage.today.totalTokens, 150);
     assert.equal(usage.today.events, 2);
     assert.equal(usage.today.outputTokens, 20);
+    assert.equal(usage.tasks.length, 1);
+    assert.equal(usage.tasks[0].totalTokens, 150);
+    assert.equal(usage.tasks[0].turns.length, 2);
+    assert.deepEqual(usage.tasks[0].turns.map((turn) => turn.totalTokens), [100, 50]);
+    assert.match(usage.tasks[0].label, /^任务 [A-F0-9]{4}$/);
+    assert.doesNotMatch(JSON.stringify(usage.tasks), /turn-1|rollout-|\.jsonl/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("labels usage without a turn id as an unidentified round", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codex-token-dashboard-unidentified-"));
+  const sessions = path.join(root, "sessions");
+  await mkdir(sessions, { recursive: true });
+  const now = new Date();
+  now.setHours(13, 0, 0, 0);
+  await writeFile(path.join(sessions, `rollout-${now.toISOString().slice(0, 10)}T00-system.jsonl`), JSON.stringify({
+    timestamp: now.toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: { last_token_usage: { input_tokens: 80, output_tokens: 20, total_tokens: 100 } },
+    },
+  }));
+  try {
+    const usage = await collectUsage({ days: 7, roots: [sessions], now });
+    assert.equal(usage.tasks.length, 1);
+    assert.equal(usage.tasks[0].turns[0].identified, false);
+    assert.equal(usage.tasks[0].turns[0].totalTokens, 100);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("groups token events between task boundaries into one conversation turn", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codex-token-dashboard-turn-boundary-"));
+  const sessions = path.join(root, "sessions");
+  await mkdir(sessions, { recursive: true });
+  const now = new Date();
+  now.setHours(14, 0, 0, 0);
+  const event = (type, minute, payload = {}) => JSON.stringify({
+    timestamp: new Date(now.getTime() + minute * 60_000).toISOString(),
+    type: "event_msg",
+    payload: { type, ...payload },
+  });
+  const usage = (total) => ({
+    info: { last_token_usage: { input_tokens: total - 10, output_tokens: 10, total_tokens: total } },
+  });
+  await writeFile(path.join(sessions, `rollout-${now.toISOString().slice(0, 10)}T00-grouped.jsonl`), [
+    event("task_started", 0, { turn_id: "private-turn-id" }),
+    event("token_count", 1, usage(100)),
+    event("token_count", 2, usage(50)),
+    event("task_complete", 3, { turn_id: "private-turn-id" }),
+  ].join("\n"));
+  try {
+    const result = await collectUsage({ days: 7, roots: [sessions], now: new Date(now.getTime() + 4 * 60_000) });
+    assert.equal(result.today.totalTokens, 150);
+    assert.equal(result.today.events, 2);
+    assert.equal(result.tasks[0].turns.length, 1);
+    assert.equal(result.tasks[0].turns[0].totalTokens, 150);
+    assert.equal(result.tasks[0].turns[0].identified, true);
+    assert.doesNotMatch(JSON.stringify(result.tasks), /private-turn-id/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

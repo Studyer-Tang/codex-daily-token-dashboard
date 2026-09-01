@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark" />
     <title>Codex Token 日历</title>
     <link rel="icon" href="/icon.svg" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=1.2.0" />
   </head>
   <body>
     <div class="ambient ambient-one"></div>
@@ -89,6 +89,18 @@
         </article>
       </section>
 
+      <section class="tasks-card panel">
+        <div class="panel-heading tasks-heading">
+          <div>
+            <p class="eyebrow">TASK &amp; TURN USAGE</p>
+            <h2>任务与每轮用量</h2>
+          </div>
+          <span id="task-summary" class="task-summary">正在统计</span>
+        </div>
+        <p class="tasks-note">仅显示匿名任务编号和 Token 数据，不读取对话正文。点击任务可查看每轮明细。</p>
+        <div id="task-list" class="task-list" aria-live="polite"></div>
+      </section>
+
       <section class="lower-grid">
         <article class="heatmap-card panel">
           <div class="panel-heading">
@@ -118,6 +130,6 @@
         <span id="diagnostics"></span>
       </footer>
     </main>
-    <script type="module" src="/app.js"></script>
+    <script type="module" src="/app.js?v=1.2.0"></script>
   </body>
 </html>

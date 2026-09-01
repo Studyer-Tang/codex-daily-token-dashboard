@@ -1,4 +1,4 @@
-const state = { days: 30, data: null, timer: null };
+const state = { days: 30, data: null, timer: null, taskLimit: 20 };
 const formatter = new Intl.NumberFormat("zh-CN");
 const compactFormatter = new Intl.NumberFormat("zh-CN", {
   notation: "compact",
@@ -85,11 +85,107 @@ function renderRecent(days) {
   $("#recent-list").innerHTML = recent.map((day) => `<div class="recent-row"><time>${day.day.slice(5).replace("-", "/")}</time><span class="recent-bar"><i style="width:${(day.totalTokens / max) * 100}%"></i></span><strong>${compact(day.totalTokens)}</strong></div>`).join("");
 }
 
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  "\"": "&quot;",
+  "'": "&#39;",
+}[character]));
+
+function activityTime(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "时间未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function renderTurnList(container, task, highThreshold, limit = 50) {
+  const visibleTurns = task.turns.slice(0, limit);
+  container.innerHTML = visibleTurns.map((turn) => {
+    const high = turn.totalTokens >= highThreshold;
+    return `<div class="turn-row">
+      <div class="turn-identity">
+        <strong>${turn.identified ? `第 ${turn.number} 轮` : "未标记轮次"}</strong>
+        <time>${escapeHtml(activityTime(turn.timestamp))}</time>
+      </div>
+      <div class="turn-parts">
+        <span>输入 ${compact(turn.inputTokens)}</span>
+        <span>缓存 ${compact(turn.cachedInputTokens)}</span>
+        <span>输出 ${compact(turn.outputTokens)}</span>
+      </div>
+      ${high ? '<span class="high-usage">高消耗</span>' : ""}
+      <strong class="turn-total">${compact(turn.totalTokens)}</strong>
+    </div>`;
+  }).join("") + (visibleTurns.length < task.turns.length
+    ? `<button class="load-more-turns">继续显示 · 还有 ${task.turns.length - visibleTurns.length} 轮</button>`
+    : "");
+  container.querySelector(".load-more-turns")?.addEventListener("click", () => {
+    renderTurnList(container, task, highThreshold, limit + 50);
+  });
+}
+
+function renderTasks(tasks = []) {
+  const list = $("#task-list");
+  const totalTurns = tasks.reduce((sum, task) => sum + task.turns.length, 0);
+  $("#task-summary").textContent = `${tasks.length} 个任务 · ${totalTurns} 轮`;
+  if (!tasks.length) {
+    list.innerHTML = '<div class="task-empty">当前范围内没有可显示的任务记录</div>';
+    return;
+  }
+
+  const maximum = Math.max(...tasks.map((task) => task.totalTokens), 1);
+  const turnValues = tasks.flatMap((task) => task.turns.map((turn) => turn.totalTokens)).sort((a, b) => a - b);
+  const median = turnValues[Math.floor(turnValues.length / 2)] || 0;
+  const highThreshold = Math.max(100_000, median * 2);
+  const visibleTasks = tasks.slice(0, state.taskLimit);
+
+  list.innerHTML = visibleTasks.map((task, taskIndex) => {
+    return `<details class="task-item" data-task-index="${taskIndex}">
+      <summary>
+        <span class="task-rank">${String(taskIndex + 1).padStart(2, "0")}</span>
+        <div class="task-identity">
+          <strong>${escapeHtml(task.label)}</strong>
+          <span>${task.turns.length} 轮 · 最近 ${escapeHtml(activityTime(task.lastActivity))}</span>
+          <i><b style="width:${Math.max(2, (task.totalTokens / maximum) * 100)}%"></b></i>
+        </div>
+        <div class="task-token">
+          <strong>${compact(task.totalTokens)}</strong>
+          <span>输入 ${compact(task.inputTokens)} · 输出 ${compact(task.outputTokens)}</span>
+        </div>
+        <span class="task-chevron">⌄</span>
+      </summary>
+      <div class="turn-list"></div>
+    </details>`;
+  }).join("") + (visibleTasks.length < tasks.length
+    ? `<button id="load-more-tasks" class="load-more-tasks">继续显示 · 还有 ${tasks.length - visibleTasks.length} 个任务</button>`
+    : "");
+
+  list.querySelectorAll(".task-item").forEach((details) => {
+    details.addEventListener("toggle", () => {
+      const container = details.querySelector(".turn-list");
+      if (!details.open || container.dataset.loaded) return;
+      const task = tasks[Number(details.dataset.taskIndex)];
+      renderTurnList(container, task, highThreshold);
+      container.dataset.loaded = "true";
+    });
+  });
+  $("#load-more-tasks")?.addEventListener("click", () => {
+    state.taskLimit += 20;
+    renderTasks(tasks);
+  });
+}
+
 function render(data) {
   state.data = data;
-  const { today, yesterday, last7, last30, days } = data;
+  const { today, yesterday, last7, last30, days, tasks = [] } = data;
   $("#today-value").textContent = format(today.totalTokens);
-  $("#today-date").textContent = `${prettyDate(today.day)} · ${today.events} 次用量事件`;
+  $("#today-date").textContent = `${prettyDate(today.day)} · ${today.events} 次模型调用`;
   $("#week-value").textContent = compact(last7.totalTokens);
   $("#week-average").textContent = `日均 ${compact(last7.totalTokens / 7)} Token`;
   $("#month-value").textContent = compact(last30.totalTokens);
@@ -110,6 +206,7 @@ function render(data) {
   renderDonut(today);
   renderHeatmap(days);
   renderRecent(days);
+  renderTasks(tasks);
   const time = new Date(data.generatedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   $("#status").className = "";
   $("#status").innerHTML = `<i></i>已同步 · ${time}`;
@@ -139,6 +236,7 @@ document.querySelectorAll("[data-days]").forEach((button) => {
     document.querySelectorAll("[data-days]").forEach((item) => item.classList.remove("active"));
     button.classList.add("active");
     state.days = Number(button.dataset.days);
+    state.taskLimit = 20;
     load();
   });
 });
