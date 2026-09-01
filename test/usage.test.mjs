@@ -105,8 +105,22 @@ test("groups token events between task boundaries into one conversation turn", a
   const usage = (total) => ({
     info: { last_token_usage: { input_tokens: total - 10, output_tokens: 10, total_tokens: total } },
   });
+  const userMessage = (text) => JSON.stringify({
+    timestamp: new Date(now.getTime() + 30_000).toISOString(),
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text }],
+      internal_chat_message_metadata_passthrough: { turn_id: "private-turn-id" },
+    },
+  });
   await writeFile(path.join(sessions, `rollout-${now.toISOString().slice(0, 10)}T00-grouped.jsonl`), [
     event("task_started", 0, { turn_id: "private-turn-id" }),
+    userMessage("<environment_context>injected details</environment_context>"),
+    userMessage("<codex_internal_context>internal injected details</codex_internal_context>"),
+    userMessage("# Files mentioned by the user:\nprivate.pdf\n\n## My request:\n请优化本地悬浮窗的任务统计"),
+    userMessage("请优化本地悬浮窗的任务统计"),
     event("token_count", 1, usage(100)),
     event("token_count", 2, usage(50)),
     event("task_complete", 3, { turn_id: "private-turn-id" }),
@@ -118,7 +132,12 @@ test("groups token events between task boundaries into one conversation turn", a
     assert.equal(result.tasks[0].turns.length, 1);
     assert.equal(result.tasks[0].turns[0].totalTokens, 150);
     assert.equal(result.tasks[0].turns[0].identified, true);
+    assert.equal(result.tasks[0].turns[0].prompt, "请优化本地悬浮窗的任务统计");
+    assert.equal(result.tasks[0].title, "请优化本地悬浮窗的任务统计");
     assert.doesNotMatch(JSON.stringify(result.tasks), /private-turn-id/);
+    assert.doesNotMatch(JSON.stringify(result.tasks), /injected details/);
+    assert.doesNotMatch(JSON.stringify(result.tasks), /internal injected details/);
+    assert.doesNotMatch(JSON.stringify(result.tasks), /private\.pdf/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

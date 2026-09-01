@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0 - 2026-09-01
+
+- Added saved Codex task titles beside anonymous task numbers when available.
+- Added privacy-filtered user prompt excerpts to native per-turn rows.
+- Filtered injected environment, browser, plugin, and handoff context from displayed prompts.
+- Added a native “小窗关注” mode that shows one selected task turn in the compact bar.
+- Added compact-bar arrows, mouse-wheel navigation, left-side mode switching, and tray display controls.
+
 ## 1.3.0 - 2026-09-01
 
 - Added native task rankings and per-turn usage details to the expanded Windows floating panel.

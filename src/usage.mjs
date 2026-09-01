@@ -13,6 +13,7 @@ const fileCache = new Map();
 let ripgrepSnapshot = null;
 let snapshotRefresh = null;
 let snapshotLoaded = false;
+let threadTitleCache = { loadedAt: 0, titles: new Map() };
 function applicationCacheDirectory() {
   if (process.env.CODEX_TOKEN_CACHE_DIR) return path.resolve(process.env.CODEX_TOKEN_CACHE_DIR);
   if (process.platform === "win32" && process.env.LOCALAPPDATA) {
@@ -106,6 +107,74 @@ function eventUsage(row, previousBySession, sessionKey) {
   return usage;
 }
 
+function conciseText(value, maximum = 240) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
+}
+
+function userPrompt(row) {
+  if (row?.type !== "response_item" || row?.payload?.type !== "message" || row?.payload?.role !== "user") return "";
+  const parts = Array.isArray(row.payload.content) ? row.payload.content : [];
+  return conciseText(parts.map((part) => {
+    if (part?.type !== "input_text" || typeof part.text !== "string") return "";
+    const text = part.text.trim();
+    const requestMarker = "## My request:";
+    if (text.includes(requestMarker)) {
+      return text.slice(text.indexOf(requestMarker) + requestMarker.length).trim();
+    }
+    if (/^(?:#\s*)?Files mentioned by the user\b/i.test(text)) return "";
+    if (/^<(recommended_plugins|environment_context|in-app-browser-context|app-context|codex_internal_context|skills_instructions|permissions|plugins_instructions|apps_instructions)\b/i.test(text)) return "";
+    if (text.startsWith("Another language model started to solve this problem")) return "";
+    return text;
+  }).filter(Boolean).join(" "));
+}
+
+function taskTitle(value) {
+  const title = conciseText(value, 80);
+  if (/^(?:#\s*)?Files mentioned by the user\b/i.test(title)) return "";
+  if (/^<(?:codex_internal_context|environment_context|app-context)\b/i.test(title)) return "";
+  if (title.startsWith("Another language model started to solve this problem")) return "";
+  return title;
+}
+
+function messageTurnId(row) {
+  const metadata = row?.payload?.internal_chat_message_metadata_passthrough;
+  return typeof metadata?.turn_id === "string" ? metadata.turn_id : "";
+}
+
+function mergePrompt(current, next) {
+  if (!next || current === next || current?.includes(next)) return current || "";
+  return conciseText([current, next].filter(Boolean).join(" "));
+}
+
+async function loadThreadTitles() {
+  if (Date.now() - threadTitleCache.loadedAt < 60_000) return threadTitleCache.titles;
+  const titles = new Map();
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(path.join(os.homedir(), ".codex", "state_5.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare("SELECT rollout_path, name, title FROM threads WHERE rollout_path IS NOT NULL").all();
+      for (const row of rows) {
+        const sessionKey = path.basename(String(row.rollout_path || "")).toLowerCase();
+        const title = taskTitle(row.name || row.title || "");
+        if (sessionKey && title) titles.set(sessionKey, title);
+      }
+    } finally {
+      database.close();
+    }
+  } catch {
+    // Node 20 and non-Codex environments may not expose node:sqlite or the state database.
+  }
+  threadTitleCache = { loadedAt: Date.now(), titles };
+  return titles;
+}
+
+async function attachTaskTitles(tasks) {
+  const titles = await loadThreadTitles();
+  for (const task of tasks.values()) task.title = taskTitle(titles.get(task.sessionKey) || task.title || "");
+}
+
 export function localDayKey(value) {
   const date = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(date.getTime())) return "";
@@ -160,6 +229,7 @@ async function parseRollout(filePath) {
   const turns = [];
   const seenEvents = new Set();
   const unidentifiedByDay = new Map();
+  const promptsByTurn = new Map();
   let previousCumulative = null;
   let activeTurn = null;
   const input = createReadStream(filePath, { encoding: "utf8" });
@@ -174,6 +244,7 @@ async function parseRollout(filePath) {
       day: localDayKey(timestamp || activeTurn.timestamp),
       timestamp: String(timestamp || activeTurn.timestamp || ""),
       identified: Boolean(activeTurn.turnId),
+      prompt: activeTurn.prompt || "",
       usage: activeTurn.usage,
     });
     activeTurn = null;
@@ -181,12 +252,21 @@ async function parseRollout(filePath) {
 
   try {
     for await (const line of lines) {
-      if (line.length > MAX_LINE_BYTES || !line.includes('"event_msg"')) continue;
-      if (!["token_count", "task_started", "task_complete"].some((type) => line.includes(`"${type}"`))) continue;
+      if (line.length > MAX_LINE_BYTES) continue;
+      const possibleEvent = line.includes('"event_msg"') && ["token_count", "task_started", "task_complete"].some((type) => line.includes(`"${type}"`));
+      const possibleUser = line.includes('"response_item"') && (line.includes('"role":"user"') || line.includes('"role": "user"'));
+      if (!possibleEvent && !possibleUser) continue;
       let row;
       try {
         row = JSON.parse(line);
       } catch {
+        continue;
+      }
+      if (row?.type === "response_item") {
+        const prompt = userPrompt(row);
+        const turnId = messageTurnId(row);
+        if (prompt && turnId) promptsByTurn.set(turnId, mergePrompt(promptsByTurn.get(turnId), prompt));
+        if (prompt && activeTurn && (!turnId || turnId === activeTurn.turnId)) activeTurn.prompt = mergePrompt(activeTurn.prompt, prompt);
         continue;
       }
       if (row?.type !== "event_msg") continue;
@@ -196,6 +276,7 @@ async function parseRollout(filePath) {
         activeTurn = {
           turnId: typeof row.payload.turn_id === "string" ? row.payload.turn_id : "",
           timestamp: String(row.timestamp || ""),
+          prompt: promptsByTurn.get(row.payload.turn_id) || "",
           usage: emptyUsage(),
         };
         continue;
@@ -221,12 +302,13 @@ async function parseRollout(filePath) {
         addUsage(activeTurn.usage, usage);
         activeTurn.timestamp = timestamp || activeTurn.timestamp;
       } else if (turnId) {
-        turns.push({ day, timestamp, identified: true, usage });
+        turns.push({ day, timestamp, identified: true, prompt: promptsByTurn.get(turnId) || "", usage });
       } else {
         const unattributed = unidentifiedByDay.get(day) || {
           day,
           timestamp,
           identified: false,
+          prompt: "",
           usage: emptyUsage(),
         };
         unattributed.timestamp = timestamp || unattributed.timestamp;
@@ -250,6 +332,7 @@ async function scanWithRipgrep(sourceRoots) {
   const seenTaskTurns = new Set();
   const activeTurns = new Map();
   const unidentifiedTurns = new Map();
+  const promptsByTurn = new Map();
   const filesWithUsage = new Set();
   const previousBySession = new Map();
   let matchedLines = 0;
@@ -258,7 +341,7 @@ async function scanWithRipgrep(sourceRoots) {
     "--with-filename",
     "--null",
     "--no-messages",
-    '"type"\\s*:\\s*"(?:token_count|task_started|task_complete)"',
+    '(?:"type"\\s*:\\s*"(?:token_count|task_started|task_complete)"|"role"\\s*:\\s*"user")',
     ...sourceRoots,
   ];
 
@@ -285,6 +368,7 @@ async function scanWithRipgrep(sourceRoots) {
         day: localDayKey(timestamp || active.timestamp),
         timestamp: String(timestamp || active.timestamp || ""),
         identified: Boolean(active.turnId),
+        prompt: active.prompt || "",
         usage: active.usage,
       }, active.turnId);
       activeTurns.delete(sessionKey);
@@ -302,14 +386,25 @@ async function scanWithRipgrep(sourceRoots) {
       } catch {
         return;
       }
-      if (row?.type !== "event_msg") return;
       const sessionKey = path.basename(filePath).toLowerCase();
+      if (row?.type === "response_item") {
+        const prompt = userPrompt(row);
+        const turnId = messageTurnId(row);
+        const promptKey = turnId ? `${sessionKey}:${turnId}` : "";
+        if (promptKey && prompt) promptsByTurn.set(promptKey, mergePrompt(promptsByTurn.get(promptKey), prompt));
+        const active = activeTurns.get(sessionKey);
+        if (prompt && active && (!turnId || turnId === active.turnId)) active.prompt = mergePrompt(active.prompt, prompt);
+        return;
+      }
+      if (row?.type !== "event_msg") return;
       const payloadType = row?.payload?.type;
       if (payloadType === "task_started") {
         finishActiveTurn(sessionKey, row.timestamp);
+        const turnId = typeof row.payload.turn_id === "string" ? row.payload.turn_id : "";
         activeTurns.set(sessionKey, {
-          turnId: typeof row.payload.turn_id === "string" ? row.payload.turn_id : "",
+          turnId,
           timestamp: String(row.timestamp || ""),
+          prompt: promptsByTurn.get(`${sessionKey}:${turnId}`) || "",
           usage: emptyUsage(),
         });
         return;
@@ -338,7 +433,7 @@ async function scanWithRipgrep(sourceRoots) {
         addUsage(active.usage, usage);
         active.timestamp = timestamp || active.timestamp;
       } else if (turnId) {
-        appendTurn(sessionKey, { day, timestamp, identified: true, usage }, turnId);
+        appendTurn(sessionKey, { day, timestamp, identified: true, prompt: promptsByTurn.get(`${sessionKey}:${turnId}`) || "", usage }, turnId);
       } else {
         const key = `${sessionKey}:${day}`;
         const unattributed = unidentifiedTurns.get(key) || {
@@ -346,6 +441,7 @@ async function scanWithRipgrep(sourceRoots) {
           day,
           timestamp,
           identified: false,
+          prompt: "",
           usage: emptyUsage(),
         };
         unattributed.timestamp = timestamp || unattributed.timestamp;
@@ -398,7 +494,7 @@ async function loadPersistedSnapshot() {
   for (const candidate of [snapshotPath, legacySnapshotPath]) {
     try {
       const raw = JSON.parse(await readFile(candidate, "utf8"));
-      if (raw.version !== 3 || !Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days) || !Array.isArray(raw.tasks)) continue;
+      if (raw.version !== 6 || !Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days) || !Array.isArray(raw.tasks)) continue;
       ripgrepSnapshot = {
         generatedAtMs: raw.generatedAtMs,
         buckets: new Map(raw.days.map((day) => [day.day, day])),
@@ -422,11 +518,12 @@ async function refreshRipgrepSnapshot(sourceRoots) {
   if (snapshotRefresh) return snapshotRefresh;
   snapshotRefresh = (async () => {
     const fresh = await scanWithRipgrep(sourceRoots);
+    await attachTaskTitles(fresh.tasks);
     ripgrepSnapshot = fresh;
     try {
       await mkdir(path.dirname(snapshotPath), { recursive: true });
       await writeFile(snapshotPath, JSON.stringify({
-        version: 3,
+        version: 6,
         generatedAtMs: fresh.generatedAtMs,
         days: [...fresh.buckets.values()],
         tasks: [...fresh.tasks.values()],
@@ -470,9 +567,11 @@ function taskBreakdown(tasks, cutoffDay, today) {
     if (!turns.length) continue;
     const usage = summarize(turns.map((turn) => turn.usage));
     const id = anonymousTaskId(task.sessionKey);
+    const fallbackTitle = turns.find((turn) => turn.prompt)?.prompt || "";
     result.push({
       id,
       label: `任务 ${id.slice(0, 4).toUpperCase()}`,
+      title: taskTitle(task.title) || taskTitle(fallbackTitle),
       firstActivity: turns[0].timestamp,
       lastActivity: turns.at(-1).timestamp,
       ...usage,
@@ -480,6 +579,7 @@ function taskBreakdown(tasks, cutoffDay, today) {
         number: index + 1,
         timestamp: turn.timestamp,
         identified: turn.identified,
+        prompt: conciseText(turn.prompt, 240),
         ...turn.usage,
       })),
     });
@@ -511,6 +611,7 @@ export async function collectUsage({ days = 30, roots, now = new Date() } = {}) 
       refreshRipgrepSnapshot(sourceRoots).catch(() => {});
     }
     if (ripgrepSnapshot) {
+      await attachTaskTitles(ripgrepSnapshot.tasks || new Map());
       const timeline = [];
       for (let index = 0; index < range; index += 1) {
         const day = shiftDay(cutoffDay, index);
@@ -587,6 +688,7 @@ export async function collectUsage({ days = 30, roots, now = new Date() } = {}) 
   const last7 = summarize(timeline.slice(-7));
   const last30 = summarize(timeline.slice(-30));
   const total = summarize(timeline);
+  if (!roots) await attachTaskTitles(tasks);
 
   return {
     generatedAt: new Date().toISOString(),

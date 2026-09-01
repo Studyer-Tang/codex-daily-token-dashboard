@@ -65,7 +65,13 @@ internal sealed class TokenWidgetForm : Form
     private int selectedTaskIndex = -1;
     private int taskScroll;
     private int turnScroll;
+    private bool compactTaskMode;
+    private string focusedTaskId = "";
+    private string pendingFocusTaskId = "";
+    private int focusedTurnIndex = -1;
     private ToolStripMenuItem compactMenuItem;
+    private ToolStripMenuItem totalModeMenuItem;
+    private ToolStripMenuItem taskModeMenuItem;
     private string statusText = "正在连接本地数据";
     private Color statusColor;
     private double todayTotal;
@@ -88,6 +94,7 @@ internal sealed class TokenWidgetForm : Form
     {
         public string Id = "";
         public string Label = "匿名任务";
+        public string Title = "";
         public string LastActivity = "";
         public double TotalTokens;
         public double InputTokens;
@@ -105,6 +112,7 @@ internal sealed class TokenWidgetForm : Form
         public int Number;
         public string Timestamp = "";
         public bool Identified;
+        public string Prompt = "";
         public double TotalTokens;
         public double InputTokens;
         public double CachedInputTokens;
@@ -139,6 +147,11 @@ internal sealed class TokenWidgetForm : Form
         var logItem = menu.Items.Add("打开诊断日志");
         compactMenuItem = (ToolStripMenuItem)menu.Items.Add("极简模式");
         compactMenuItem.Checked = compactMode;
+        var displayMenu = (ToolStripMenuItem)menu.Items.Add("小窗显示");
+        totalModeMenuItem = (ToolStripMenuItem)displayMenu.DropDownItems.Add("今日总用量");
+        taskModeMenuItem = (ToolStripMenuItem)displayMenu.DropDownItems.Add("关注任务的轮次");
+        totalModeMenuItem.Checked = true;
+        taskModeMenuItem.Enabled = false;
         var topItem = (ToolStripMenuItem)menu.Items.Add("始终置顶");
         topItem.Checked = true;
         menu.Items.Add(new ToolStripSeparator());
@@ -147,6 +160,8 @@ internal sealed class TokenWidgetForm : Form
         refreshItem.Click += delegate { RequestUsage(); ShowWidget(); };
         logItem.Click += delegate { OpenLog(); };
         compactMenuItem.Click += delegate { ToggleCompact(); };
+        totalModeMenuItem.Click += delegate { SetCompactDisplay(false); };
+        taskModeMenuItem.Click += delegate { SetCompactDisplay(true); };
         topItem.Click += delegate { TopMost = !TopMost; topItem.Checked = TopMost; Invalidate(); };
         exitItem.Click += delegate { allowExit = true; Close(); };
         trayIcon = new NotifyIcon
@@ -235,12 +250,33 @@ internal sealed class TokenWidgetForm : Form
 
     private void DrawCompact(Graphics g)
     {
-        Draw(g, "今日用量", 12, 8, 7f, secondary);
-        Draw(g, dataReady ? FormatTiny(todayTotal) : "—", 11, 26, 15.5f, text, FontStyle.Bold);
+        var focusedTask = FocusedTask();
+        var focusedTurn = FocusedTurn(focusedTask);
+        if (compactTaskMode && focusedTask != null && focusedTurn != null)
+        {
+            var taskName = focusedTask.Label + (String.IsNullOrWhiteSpace(focusedTask.Title) ? "" : " · " + focusedTask.Title);
+            Draw(g, ShortMessage(taskName, 15), 12, 8, 6.2f, secondary);
+            Draw(g, FormatTiny(focusedTurn.TotalTokens), 11, 26, 15.5f, text, FontStyle.Bold);
+        }
+        else
+        {
+            Draw(g, "今日总用量", 12, 8, 7f, secondary);
+            Draw(g, dataReady ? FormatTiny(todayTotal) : "—", 11, 26, 15.5f, text, FontStyle.Bold);
+        }
         using (var separator = new Pen(border)) g.DrawLine(separator, 96, 11, 96, 56);
-        using (var dot = new SolidBrush(statusColor)) g.FillEllipse(dot, 108, 22, 5, 5);
-        Draw(g, CompactStatusText(), 119, 13, 6.9f, statusColor);
-        Draw(g, "本地 · 5 分钟刷新", 108, 35, 6.2f, tertiary);
+        if (compactTaskMode && focusedTask != null && focusedTurn != null)
+        {
+            DrawCentered(g, "‹", new Font("Segoe UI", 10), secondary, new Rectangle(104, 9, 22, 22));
+            DrawCentered(g, (focusedTurnIndex + 1) + " / " + focusedTask.Turns.Count, new Font("Segoe UI", 6.7f, FontStyle.Bold), text, new Rectangle(126, 9, 60, 22));
+            DrawCentered(g, "›", new Font("Segoe UI", 10), secondary, new Rectangle(186, 9, 22, 22));
+            Draw(g, ShortMessage(String.IsNullOrWhiteSpace(focusedTurn.Prompt) ? "未记录提示词" : focusedTurn.Prompt, 14), 106, 35, 5.8f, tertiary);
+        }
+        else
+        {
+            using (var dot = new SolidBrush(statusColor)) g.FillEllipse(dot, 108, 22, 5, 5);
+            Draw(g, CompactStatusText(), 119, 13, 6.9f, statusColor);
+            Draw(g, focusedTask == null ? "本地 · 5 分钟刷新" : "点击左侧切换任务", 108, 35, 6.2f, tertiary);
+        }
 
         var expandRect = new Rectangle(212, 10, 20, 20);
         FillRound(g, expandRect, 7, surfaceHigh);
@@ -396,7 +432,7 @@ internal sealed class TokenWidgetForm : Form
             FillRound(g, rect, 11, surface);
             using (var p = new Pen(border)) using (var path = Rounded(rect, 11)) g.DrawPath(p, path);
             DrawCentered(g, (index + 1).ToString("00"), new Font("Segoe UI", 6.5f), tertiary, new Rectangle(rect.X + 4, rect.Y, 28, rect.Height));
-            Draw(g, task.Label, rect.X + 36, rect.Y + 7, 8, text, FontStyle.Bold);
+            Draw(g, ShortMessage(TaskDisplayName(task), 24), rect.X + 36, rect.Y + 7, 8, text, FontStyle.Bold);
             Draw(g, task.TurnCount + " 轮 · " + FormatActivity(task.LastActivity), rect.X + 36, rect.Y + 25, 6.2f, tertiary);
             DrawRight(g, FormatCompact(task.TotalTokens), rect.Right - 13, rect.Y + 8, 8.5f, text);
             var bar = new Rectangle(rect.X + 36, rect.Bottom - 8, 210, 3);
@@ -412,10 +448,14 @@ internal sealed class TokenWidgetForm : Form
         var back = new Rectangle(18, 67, 34, 25);
         FillRound(g, back, 8, surfaceHigh);
         DrawCentered(g, "‹", new Font("Segoe UI", 12), secondary, back);
-        Draw(g, task.Label, 61, 68, 10, text, FontStyle.Bold);
+        Draw(g, ShortMessage(TaskDisplayName(task), 22), 61, 68, 10, text, FontStyle.Bold);
         Draw(g, task.TurnCount + " 轮 · " + FormatActivity(task.LastActivity), 61, 88, 6.5f, tertiary);
+        var focusRect = new Rectangle(286, 67, 78, 25);
+        var isFocused = focusedTaskId == task.Id && compactTaskMode;
+        FillRound(g, focusRect, 8, isFocused ? Color.FromArgb(43, 53, 50) : surfaceHigh);
+        DrawCentered(g, isFocused ? "小窗显示中" : "小窗关注", new Font("Microsoft YaHei UI", 6.3f, FontStyle.Bold), isFocused ? blue : secondary, focusRect);
         if (task.DetailsLoaded && task.Turns.Count > 6)
-            DrawRight(g, (turnScroll + 1) + "–" + Math.Min(task.Turns.Count, turnScroll + 6) + " / " + task.Turns.Count, 364, 88, 6.2f, tertiary);
+            DrawRight(g, (turnScroll + 1) + "–" + Math.Min(task.Turns.Count, turnScroll + 6) + " / " + task.Turns.Count, 278, 88, 6.2f, tertiary);
 
         var summary = new Rectangle(18, 105, 346, 52);
         FillRound(g, summary, 11, surface);
@@ -451,10 +491,11 @@ internal sealed class TokenWidgetForm : Form
             var y = 166 + slot * 57;
             var rect = new Rectangle(18, y, 346, 51);
             FillRound(g, rect, 9, index % 2 == 0 ? surface : bg);
-            Draw(g, turn.Identified ? "第 " + turn.Number + " 轮" : "未标记轮次", rect.X + 12, rect.Y + 7, 7.2f, text, FontStyle.Bold);
-            Draw(g, FormatActivity(turn.Timestamp), rect.X + 12, rect.Y + 26, 6f, tertiary);
-            DrawRight(g, FormatCompact(turn.TotalTokens), rect.Right - 12, rect.Y + 7, 8, text);
-            DrawRight(g, "输入 " + FormatTiny(turn.InputTokens) + " · 缓存 " + FormatTiny(turn.CachedInputTokens) + " · 输出 " + FormatTiny(turn.OutputTokens), rect.Right - 12, rect.Y + 27, 5.8f, tertiary);
+            Draw(g, turn.Identified ? "第 " + turn.Number + " 轮" : "未标记轮次", rect.X + 12, rect.Y + 4, 7.2f, text, FontStyle.Bold);
+            DrawRight(g, FormatCompact(turn.TotalTokens), rect.Right - 12, rect.Y + 4, 8, text);
+            Draw(g, ShortMessage(String.IsNullOrWhiteSpace(turn.Prompt) ? "未记录提示词" : turn.Prompt, 35), rect.X + 12, rect.Y + 19, 5.9f, secondary);
+            Draw(g, FormatActivity(turn.Timestamp), rect.X + 12, rect.Y + 35, 5.6f, tertiary);
+            DrawRight(g, "输入 " + FormatTiny(turn.InputTokens) + " · 缓存 " + FormatTiny(turn.CachedInputTokens) + " · 输出 " + FormatTiny(turn.OutputTokens), rect.Right - 12, rect.Y + 35, 5.4f, tertiary);
         }
     }
 
@@ -481,6 +522,9 @@ internal sealed class TokenWidgetForm : Form
         {
             if (new Rectangle(234, 6, 24, 28).Contains(e.Location)) { HideToTray(); return; }
             if (new Rectangle(208, 6, 26, 28).Contains(e.Location)) { ToggleCompact(); return; }
+            if (compactTaskMode && new Rectangle(100, 6, 28, 30).Contains(e.Location)) { ShiftFocusedTurn(-1); return; }
+            if (compactTaskMode && new Rectangle(184, 6, 26, 30).Contains(e.Location)) { ShiftFocusedTurn(1); return; }
+            if (new Rectangle(4, 4, 94, 60).Contains(e.Location) && FocusedTask() != null) { SetCompactDisplay(!compactTaskMode); return; }
             ReleaseCapture();
             SendMessage(Handle, 0xA1, new IntPtr(2), IntPtr.Zero);
             return;
@@ -495,6 +539,13 @@ internal sealed class TokenWidgetForm : Form
         {
             if (selectedTaskIndex >= 0)
             {
+                var selected = selectedTaskIndex < usageTasks.Count ? usageTasks[selectedTaskIndex] : null;
+                if (new Rectangle(286, 67, 78, 25).Contains(e.Location) && selected != null)
+                {
+                    if (selected.DetailsLoaded) FocusTaskInCompact(selected);
+                    else { pendingFocusTaskId = selected.Id; RequestTaskDetails(selected); }
+                    return;
+                }
                 if (new Rectangle(18, 67, 34, 25).Contains(e.Location))
                 {
                     selectedTaskIndex = -1;
@@ -502,7 +553,6 @@ internal sealed class TokenWidgetForm : Form
                     Invalidate();
                     return;
                 }
-                var selected = selectedTaskIndex < usageTasks.Count ? usageTasks[selectedTaskIndex] : null;
                 if (selected != null && !selected.DetailsLoading && (!selected.DetailsLoaded || !String.IsNullOrWhiteSpace(selected.DetailError)) && new Rectangle(18, 170, 346, 250).Contains(e.Location))
                 {
                     RequestTaskDetails(selected);
@@ -531,17 +581,24 @@ internal sealed class TokenWidgetForm : Form
     {
         base.OnMouseMove(e);
         var active = compactMode
-            ? new Rectangle(208, 6, 50, 28).Contains(e.Location)
+            ? new Rectangle(208, 6, 50, 28).Contains(e.Location) ||
+                (FocusedTask() != null && new Rectangle(4, 4, 94, 60).Contains(e.Location)) ||
+                (compactTaskMode && new Rectangle(100, 6, 110, 30).Contains(e.Location))
             : new Rectangle(165, 17, 203, 28).Contains(e.Location) || new Rectangle(310, 521, 54, 25).Contains(e.Location) ||
                 (taskView && selectedTaskIndex < 0 && e.Y >= 116 && e.Y < 522) ||
-                (taskView && selectedTaskIndex >= 0 && new Rectangle(18, 67, 34, 25).Contains(e.Location));
+                (taskView && selectedTaskIndex >= 0 && (new Rectangle(18, 67, 34, 25).Contains(e.Location) || new Rectangle(286, 67, 78, 25).Contains(e.Location)));
         Cursor = active ? Cursors.Hand : (e.Y < 58 ? Cursors.SizeAll : Cursors.Default);
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
         base.OnMouseWheel(e);
-        if (compactMode || !taskView) return;
+        if (compactMode)
+        {
+            if (compactTaskMode) ShiftFocusedTurn(e.Delta > 0 ? -1 : 1);
+            return;
+        }
+        if (!taskView) return;
         var direction = e.Delta > 0 ? -3 : 3;
         if (selectedTaskIndex >= 0 && selectedTaskIndex < usageTasks.Count)
         {
@@ -674,6 +731,15 @@ internal sealed class TokenWidgetForm : Form
                     {
                         if (ServiceHealthy())
                         {
+                            // A widget replacement can briefly see the previous widget's service
+                            // before that service notices its parent exited. Verify an unowned
+                            // startup service is stable so the new widget can take over if needed.
+                            if (reason == "应用启动" && ownedServer == null)
+                            {
+                                Thread.Sleep(2500);
+                                if (!ServiceHealthy())
+                                    throw new WebException("检测到旧统计服务已退出，正在接管");
+                            }
                             Log("INFO", "本地统计服务已恢复");
                             BeginInvoke(new Action(delegate
                             {
@@ -808,7 +874,13 @@ internal sealed class TokenWidgetForm : Form
                 var detail = ParseUsageTask(Dict(items[0]), false);
                 task.Turns = detail.Turns;
                 task.TurnCount = detail.TurnCount;
+                if (!String.IsNullOrWhiteSpace(detail.Title)) task.Title = detail.Title;
                 task.DetailsLoaded = true;
+                if (pendingFocusTaskId == task.Id)
+                {
+                    pendingFocusTaskId = "";
+                    FocusTaskInCompact(task);
+                }
                 Log("INFO", "任务轮次读取成功：" + task.Id);
             }
             catch (Exception error) { failure = error; }
@@ -970,6 +1042,7 @@ internal sealed class TokenWidgetForm : Form
                 if (previous.TryGetValue(parsed.Id, out existing))
                 {
                     existing.Label = parsed.Label;
+                    existing.Title = parsed.Title;
                     existing.LastActivity = parsed.LastActivity;
                     existing.TotalTokens = parsed.TotalTokens;
                     existing.InputTokens = parsed.InputTokens;
@@ -986,6 +1059,7 @@ internal sealed class TokenWidgetForm : Form
         if (!String.IsNullOrWhiteSpace(selectedId))
             for (var i = 0; i < usageTasks.Count; i++) if (usageTasks[i].Id == selectedId) { selectedTaskIndex = i; break; }
         taskScroll = Math.Max(0, Math.Min(taskScroll, Math.Max(0, usageTasks.Count - 7)));
+        SetCompactDisplay(compactTaskMode);
         dataReady = true;
         SetStatus("已同步 · " + DateTime.Now.ToString("HH:mm"), cyan);
         toolTip.SetToolTip(this, "拖动顶部移动 · 右上角可置顶或隐藏");
@@ -999,6 +1073,7 @@ internal sealed class TokenWidgetForm : Form
         {
             Id = TextValue(item, "id"),
             Label = TextValue(item, "label"),
+            Title = TextValue(item, "title"),
             LastActivity = TextValue(item, "lastActivity"),
             TotalTokens = NumberValue(item, "totalTokens"),
             InputTokens = NumberValue(item, "inputTokens"),
@@ -1019,6 +1094,7 @@ internal sealed class TokenWidgetForm : Form
                     Number = (int)Math.Round(NumberValue(turn, "number")),
                     Timestamp = TextValue(turn, "timestamp"),
                     Identified = BooleanValue(turn, "identified"),
+                    Prompt = TextValue(turn, "prompt"),
                     TotalTokens = NumberValue(turn, "totalTokens"),
                     InputTokens = NumberValue(turn, "inputTokens"),
                     CachedInputTokens = NumberValue(turn, "cachedInputTokens"),
@@ -1056,6 +1132,53 @@ internal sealed class TokenWidgetForm : Form
     {
         DateTime timestamp;
         return DateTime.TryParse(value, out timestamp) ? timestamp.ToLocalTime().ToString("MM/dd HH:mm") : "时间未知";
+    }
+
+    private static string TaskDisplayName(UsageTask task)
+    {
+        if (task == null) return "匿名任务";
+        return task.Label + (String.IsNullOrWhiteSpace(task.Title) ? "" : " · " + task.Title);
+    }
+
+    private UsageTask FocusedTask()
+    {
+        if (String.IsNullOrWhiteSpace(focusedTaskId)) return null;
+        foreach (var task in usageTasks) if (task.Id == focusedTaskId) return task;
+        return null;
+    }
+
+    private UsageTurn FocusedTurn(UsageTask task)
+    {
+        if (task == null || task.Turns.Count == 0) return null;
+        focusedTurnIndex = Math.Max(0, Math.Min(focusedTurnIndex, task.Turns.Count - 1));
+        return task.Turns[focusedTurnIndex];
+    }
+
+    private void FocusTaskInCompact(UsageTask task)
+    {
+        if (task == null || !task.DetailsLoaded || task.Turns.Count == 0) return;
+        focusedTaskId = task.Id;
+        focusedTurnIndex = task.Turns.Count - 1;
+        SetCompactDisplay(true);
+        toolTip.SetToolTip(this, "小窗正在显示关注任务 · 滚轮或左右箭头切换轮次 · 点击左侧切换总量");
+    }
+
+    private void SetCompactDisplay(bool showTask)
+    {
+        var task = FocusedTask();
+        compactTaskMode = showTask && task != null && task.Turns.Count > 0;
+        totalModeMenuItem.Checked = !compactTaskMode;
+        taskModeMenuItem.Checked = compactTaskMode;
+        taskModeMenuItem.Enabled = task != null && task.Turns.Count > 0;
+        Invalidate();
+    }
+
+    private void ShiftFocusedTurn(int amount)
+    {
+        var task = FocusedTask();
+        if (task == null || task.Turns.Count == 0) return;
+        focusedTurnIndex = Math.Max(0, Math.Min(task.Turns.Count - 1, focusedTurnIndex + amount));
+        Invalidate();
     }
 
     private void SetStatus(string value, Color color) { statusText = value; statusColor = color; Invalidate(); }
