@@ -7,7 +7,8 @@ import { codexDataDirectory, collectUsage, groupTasksByRoot, normalizeUsage, par
 
 test("discovers the default or configured Codex data directory without a user-specific path", () => {
   assert.equal(codexDataDirectory({ environment: {}, home: path.join("C:", "Users", "another-user") }), path.join("C:", "Users", "another-user", ".codex"));
-  assert.equal(codexDataDirectory({ environment: { CODEX_HOME: path.join("D:", "CodexData") }, home: "ignored" }), path.resolve("D:", "CodexData"));
+  const configured = path.win32.join("D:\\", "CodexData");
+  assert.equal(codexDataDirectory({ environment: { CODEX_HOME: configured }, home: "ignored" }), path.resolve(configured));
 });
 
 test("reads the same task names shown in the Codex project sidebar", () => {
