@@ -122,11 +122,13 @@ async function load() {
   $("#status").innerHTML = "<i></i>正在读取本地日志…";
   try {
     const response = await fetch(`/api/usage?days=${state.days}`, { cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    render(await response.json());
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+    render(payload);
   } catch (error) {
-    $("#status").className = "error";
-    $("#status").innerHTML = `<i></i>读取失败：${error.message}`;
+    const status = $("#status");
+    status.className = "error";
+    status.replaceChildren(document.createElement("i"), document.createTextNode(`读取失败：${error.message}`));
   } finally {
     refresh.classList.remove("loading");
   }

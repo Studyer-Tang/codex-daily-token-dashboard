@@ -8,11 +8,17 @@ jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
       - run: npm test
+      - run: node --check server.mjs
+      - run: node --check src/usage.mjs
+      - run: node --check src/usage-worker.mjs
       - name: Compile Windows widget
         shell: powershell
         run: Add-Type -Path '.\Widget.cs' -ReferencedAssemblies 'System.Windows.Forms','System.Drawing','System.Web.Extensions' -OutputAssembly '.\CodexTokenWidget.ci.exe' -OutputType WindowsApplication
+      - name: Build standalone package
+        shell: powershell
+        run: .\scripts\package-windows.ps1 -IncludeBundledNode

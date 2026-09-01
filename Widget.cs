@@ -7,6 +7,7 @@ using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -18,11 +19,16 @@ internal static class Program
     {
         bool created;
         using (var mutex = new Mutex(true, "Local\\CodexDailyTokenWidgetNative", out created))
+        using (var showSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "Local\\CodexDailyTokenWidgetShow"))
         {
-            if (!created) return;
+            if (!created)
+            {
+                showSignal.Set();
+                return;
+            }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new TokenWidgetForm());
+            Application.Run(new TokenWidgetForm(showSignal));
         }
     }
 }
@@ -46,10 +52,11 @@ internal sealed class TokenWidgetForm : Form
     private readonly ToolTip toolTip;
     private readonly object logLock = new object();
     private readonly object recoveryLock = new object();
+    private readonly RegisteredWaitHandle showRegistration;
     private Process ownedServer;
     private bool requestBusy;
     private bool recoveryBusy;
-    private bool allowExit;
+    private volatile bool allowExit;
     private bool shownTrayHint;
     private bool dataReady;
     private bool compactMode;
@@ -77,7 +84,7 @@ internal sealed class TokenWidgetForm : Form
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
-    public TokenWidgetForm()
+    public TokenWidgetForm(EventWaitHandle showSignal)
     {
         Text = "Codex Token Widget";
         ClientSize = new Size(382, 558);
@@ -116,6 +123,17 @@ internal sealed class TokenWidgetForm : Form
             Visible = true
         };
         trayIcon.DoubleClick += delegate { ShowWidget(); };
+        showRegistration = ThreadPool.RegisterWaitForSingleObject(
+            showSignal,
+            delegate(object state, bool timedOut)
+            {
+                if (allowExit || IsDisposed || !IsHandleCreated) return;
+                try { BeginInvoke(new Action(ShowWidget)); } catch { }
+            },
+            null,
+            Timeout.Infinite,
+            false
+        );
 
         toolTip = new ToolTip { InitialDelay = 350, ReshowDelay = 100, AutoPopDelay = 3000, BackColor = surfaceHigh, ForeColor = text };
         toolTip.SetToolTip(this, "拖动顶部移动 · 右上角可置顶或隐藏");
@@ -389,9 +407,10 @@ internal sealed class TokenWidgetForm : Form
                 ownedServer = null;
             }
             var root = AppDomain.CurrentDomain.BaseDirectory;
+            var bundledNode = Path.Combine(root, "runtime", "node.exe");
             var startInfo = new ProcessStartInfo
             {
-                FileName = "node.exe",
+                FileName = File.Exists(bundledNode) ? bundledNode : "node.exe",
                 Arguments = "\"" + Path.Combine(root, "server.mjs") + "\"",
                 WorkingDirectory = root,
                 UseShellExecute = false,
@@ -402,6 +421,7 @@ internal sealed class TokenWidgetForm : Form
                 StandardOutputEncoding = Encoding.UTF8,
                 StandardErrorEncoding = Encoding.UTF8
             };
+            startInfo.EnvironmentVariables["CODEX_TOKEN_PARENT_PID"] = Process.GetCurrentProcess().Id.ToString();
             var serverProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             ownedServer = serverProcess;
             serverProcess.OutputDataReceived += delegate(object sender, DataReceivedEventArgs args)
@@ -504,7 +524,14 @@ internal sealed class TokenWidgetForm : Form
 
     private bool ServiceHealthy()
     {
-        try { var request = WebRequest.Create("http://127.0.0.1:" + Port + "/api/health"); request.Timeout = 700; using (request.GetResponse()) return true; }
+        try
+        {
+            var request = WebRequest.Create("http://127.0.0.1:" + Port + "/api/health");
+            request.Timeout = 1500;
+            using (var response = request.GetResponse())
+            using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                return reader.ReadToEnd().Contains("codex-daily-token-dashboard");
+        }
         catch { return false; }
     }
 
@@ -514,21 +541,34 @@ internal sealed class TokenWidgetForm : Form
         requestBusy = true;
         SetStatus("正在读取本地记录", amber);
         var client = new WebClient { Encoding = System.Text.Encoding.UTF8 };
+        var timedOut = 0;
+        var timeoutTimer = new System.Threading.Timer(
+            delegate(object state)
+            {
+                Interlocked.Exchange(ref timedOut, 1);
+                try { client.CancelAsync(); } catch { }
+            },
+            null,
+            50000,
+            Timeout.Infinite
+        );
         client.DownloadStringCompleted += delegate(object sender, DownloadStringCompletedEventArgs args)
         {
             Exception failure = null;
             try
             {
+                if (args.Cancelled && Interlocked.CompareExchange(ref timedOut, 0, 0) == 1)
+                    throw new TimeoutException("读取用量请求超过 50 秒");
                 if (args.Cancelled) throw new WebException("用量请求已取消");
                 if (args.Error != null) throw args.Error;
                 RenderUsage(new JavaScriptSerializer().DeserializeObject(args.Result) as Dictionary<string, object>);
             }
             catch (Exception error) { failure = error; }
-            finally { requestBusy = false; client.Dispose(); }
+            finally { requestBusy = false; timeoutTimer.Dispose(); client.Dispose(); }
             if (failure != null)
             {
                 var detail = DescribeError(failure);
-                SetStatus(detail + " · 正在自动重启", Color.FromArgb(251, 113, 133));
+                SetStatus(detail + " · 正在自动恢复", Color.FromArgb(251, 113, 133));
                 toolTip.SetToolTip(this, "错误详情：" + detail + "\n正在自动检测并恢复本地服务");
                 LogError("读取用量失败", failure);
                 BeginRecovery(detail);
@@ -549,15 +589,43 @@ internal sealed class TokenWidgetForm : Form
             if (webError.Status == WebExceptionStatus.ProtocolError)
             {
                 var response = webError.Response as HttpWebResponse;
-                return response == null
-                    ? "本地服务返回协议错误"
-                    : "本地服务返回 HTTP " + (int)response.StatusCode;
+                if (response == null) return "本地服务返回协议错误";
+                var prefix = "本地服务返回 HTTP " + (int)response.StatusCode;
+                try
+                {
+                    using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    {
+                        var payload = new JavaScriptSerializer().DeserializeObject(reader.ReadToEnd()) as Dictionary<string, object>;
+                        var detail = payload != null && payload.ContainsKey("detail")
+                            ? Convert.ToString(payload["detail"])
+                            : payload != null && payload.ContainsKey("error") ? Convert.ToString(payload["error"]) : "";
+                        return String.IsNullOrWhiteSpace(detail) ? prefix : prefix + "：" + ShortMessage(detail, 34);
+                    }
+                }
+                catch { return prefix; }
             }
         }
         if (error is InvalidDataException || error is KeyNotFoundException) return "返回的用量数据格式异常";
-        if (error is TimeoutException) return "本地服务启动超时";
-        var message = (error.Message ?? error.GetType().Name).Replace("\r", " ").Replace("\n", " ").Trim();
-        return message.Length > 48 ? message.Substring(0, 47) + "…" : message;
+        if (error is TimeoutException) return ShortMessage(error.Message, 48);
+        return ShortMessage(error.Message ?? error.GetType().Name, 48);
+    }
+
+    private static string ShortMessage(string value, int maximum)
+    {
+        var message = (value ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        return message.Length > maximum ? message.Substring(0, maximum - 1) + "…" : message;
+    }
+
+    private string RedactLogText(string value)
+    {
+        var result = value ?? "";
+        var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var appDirectory = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+        if (!String.IsNullOrWhiteSpace(appDirectory))
+            result = Regex.Replace(result, Regex.Escape(appDirectory), "%APPDIR%", RegexOptions.IgnoreCase);
+        if (!String.IsNullOrWhiteSpace(userProfile))
+            result = Regex.Replace(result, Regex.Escape(userProfile), "%USERPROFILE%", RegexOptions.IgnoreCase);
+        return result;
     }
 
     private void LogError(string context, Exception error)
@@ -581,7 +649,7 @@ internal sealed class TokenWidgetForm : Form
                 }
                 File.AppendAllText(
                     logPath,
-                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + level + "] " + message + Environment.NewLine
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + level + "] " + RedactLogText(message) + Environment.NewLine
                 );
             }
         }
@@ -658,10 +726,22 @@ internal sealed class TokenWidgetForm : Form
         shownTrayHint = true;
     }
 
-    private void OnFormClosing(object sender, FormClosingEventArgs e) { if (allowExit) return; e.Cancel = true; HideToTray(); }
+    private void OnFormClosing(object sender, FormClosingEventArgs e)
+    {
+        if (allowExit || e.CloseReason == CloseReason.WindowsShutDown ||
+            e.CloseReason == CloseReason.TaskManagerClosing || e.CloseReason == CloseReason.ApplicationExitCall)
+        {
+            allowExit = true;
+            return;
+        }
+        e.Cancel = true;
+        HideToTray();
+    }
+
     private void OnFormClosed(object sender, FormClosedEventArgs e)
     {
         allowExit = true;
+        showRegistration.Unregister(null);
         refreshTimer.Stop();
         trayIcon.Visible = false;
         trayIcon.Dispose();

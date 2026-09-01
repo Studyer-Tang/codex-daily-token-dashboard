@@ -12,7 +12,17 @@ const fileCache = new Map();
 let ripgrepSnapshot = null;
 let snapshotRefresh = null;
 let snapshotLoaded = false;
-const snapshotPath = path.resolve(
+function applicationCacheDirectory() {
+  if (process.env.CODEX_TOKEN_CACHE_DIR) return path.resolve(process.env.CODEX_TOKEN_CACHE_DIR);
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) {
+    return path.join(process.env.LOCALAPPDATA, "CodexTokenWidget");
+  }
+  if (process.env.XDG_CACHE_HOME) return path.join(process.env.XDG_CACHE_HOME, "codex-token-widget");
+  return path.join(os.homedir(), ".cache", "codex-token-widget");
+}
+
+const snapshotPath = path.join(applicationCacheDirectory(), "usage-summary.json");
+const legacySnapshotPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   ".cache",
@@ -267,16 +277,25 @@ async function scanWithRipgrep(sourceRoots) {
 async function loadPersistedSnapshot() {
   if (snapshotLoaded) return;
   snapshotLoaded = true;
-  try {
-    const raw = JSON.parse(await readFile(snapshotPath, "utf8"));
-    if (!Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days)) return;
-    ripgrepSnapshot = {
-      generatedAtMs: raw.generatedAtMs,
-      buckets: new Map(raw.days.map((day) => [day.day, day])),
-      diagnostics: { ...raw.diagnostics, cacheSource: "disk" },
-    };
-  } catch {
-    // A missing or stale cache is harmless; the next scan recreates it.
+  for (const candidate of [snapshotPath, legacySnapshotPath]) {
+    try {
+      const raw = JSON.parse(await readFile(candidate, "utf8"));
+      if (!Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days)) continue;
+      ripgrepSnapshot = {
+        generatedAtMs: raw.generatedAtMs,
+        buckets: new Map(raw.days.map((day) => [day.day, day])),
+        diagnostics: { ...raw.diagnostics, cacheSource: "disk" },
+      };
+      if (candidate === legacySnapshotPath) {
+        try {
+          await mkdir(path.dirname(snapshotPath), { recursive: true });
+          await writeFile(snapshotPath, JSON.stringify(raw), "utf8");
+        } catch { }
+      }
+      return;
+    } catch {
+      // Try the legacy location before falling back to a fresh scan.
+    }
   }
 }
 

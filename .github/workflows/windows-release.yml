@@ -1,0 +1,32 @@
+name: Windows release package
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Build self-contained package
+        shell: powershell
+        run: .\scripts\package-windows.ps1 -IncludeBundledNode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CodexTokenWidget-windows-x64
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/* --generate-notes --verify-tag

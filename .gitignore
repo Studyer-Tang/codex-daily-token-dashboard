@@ -5,3 +5,7 @@ Thumbs.db
 .cache/
 node_modules/
 CodexTokenWidget.ci.exe
+CodexTokenWidget.exe
+dist/
+.release-staging/
+.tmp-package-test/

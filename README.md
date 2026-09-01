@@ -13,13 +13,15 @@
 - 始终置顶、可拖动，也可以临时取消置顶
 - 区分缓存输入、非缓存输入、输出和推理输出
 - 自动读取活动会话与归档会话，按会话 ID 去重
+- 日志扫描在独立 Worker 中执行，健康检查不会被大文件扫描阻塞
 - 每 5 分钟自动刷新，并将最近一次聚合摘要缓存在本机
+- 请求超时、服务退出或挂起时自动诊断、重启并重试
 - 只绑定 `127.0.0.1`，不需要账号、API Key 或网络请求
 - 不保存、不返回提示词、回复、项目路径或凭据
 
 ## Windows 快速使用
 
-需要 Windows 10/11 和 Node.js 20 或更新版本。双击：
+推荐从 GitHub Actions 或 Release 下载 `CodexTokenWidget-windows-x64.zip`。压缩包已经包含 Node.js，无需另行安装；解压整个文件夹后双击：
 
 ```text
 CodexTokenWidget.exe
@@ -27,7 +29,9 @@ CodexTokenWidget.exe
 
 悬浮窗会显示在桌面右上角，每 5 分钟自动刷新。点击顶部 `–` 可切换为只保留今日用量和缓存环的极简模式，双击极简卡片或点击 `+` 恢复完整视图。按住窗口顶部可拖动，`TOP` 可切换置顶；点击 `×` 会隐藏到系统托盘，双击托盘图标恢复，右键可刷新或彻底退出。
 
-也可以在终端中运行：
+再次双击程序不会产生第二个实例，而会直接唤出现有悬浮窗。Windows 关机或注销时程序会正常退出；如果挂件异常结束，本地统计服务也会检测父进程并自行关闭。
+
+从源码运行需要 Node.js 20 或更新版本，也可以在终端中运行：
 
 ```powershell
 npm run widget
@@ -41,7 +45,7 @@ npm run widget
 %LOCALAPPDATA%\CodexTokenWidget\widget.log
 ```
 
-也可以右键系统托盘中的 Codex Token 图标，选择 **打开诊断日志**。日志达到 1 MB 后自动轮换，只保留当前文件和上一份日志。
+也可以右键系统托盘中的 Codex Token 图标，选择 **打开诊断日志**。日志达到 1 MB 后自动轮换，只保留当前文件和上一份日志。写入前会将用户目录和程序目录替换为 `%USERPROFILE%`、`%APPDIR%`，不会记录提示词或回复内容。
 
 ## 可选网页仪表盘
 
@@ -66,6 +70,8 @@ npm start
 
 统计是本机 Codex 记录口径，不等同于 API 账单或订阅额度。
 
+聚合缓存和诊断日志默认位于 `%LOCALAPPDATA%\CodexTokenWidget`，不会写入 Git 仓库。环境变量 `CODEX_TOKEN_CACHE_DIR` 可以单独修改聚合缓存目录。
+
 ## 测试
 
 ```powershell
@@ -81,6 +87,14 @@ npm run build:widget
 ```
 
 构建前请从托盘彻底退出正在运行的悬浮窗。构建结果为项目根目录下的 `CodexTokenWidget.exe`。构建脚本不会隐藏 PowerShell、绕过执行策略或修改系统安全设置。
+
+生成包含 Node.js、网页资源和 SHA-256 校验值的完整发布包：
+
+```powershell
+npm run package:windows
+```
+
+二进制不直接提交到仓库；GitHub Actions 会从公开源码重新编译，并在 `dist` 中生成 ZIP 和校验文件。
 
 ## 参考项目
 

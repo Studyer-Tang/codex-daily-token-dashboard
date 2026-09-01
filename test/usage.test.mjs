@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -56,6 +56,67 @@ test("aggregates last_token_usage by local day and deduplicates turn ids", async
     assert.equal(usage.today.totalTokens, 150);
     assert.equal(usage.today.events, 2);
     assert.equal(usage.today.outputTokens, 20);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("derives deltas from cumulative-only legacy events", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codex-token-dashboard-cumulative-"));
+  const sessions = path.join(root, "sessions");
+  await mkdir(sessions, { recursive: true });
+  const now = new Date();
+  now.setHours(12, 0, 0, 0);
+  const cumulative = (turnId, total, minute) => JSON.stringify({
+    timestamp: new Date(now.getTime() + minute * 60_000).toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      turn_id: turnId,
+      info: { total_token_usage: { input_tokens: total - 10, output_tokens: 10, total_tokens: total } },
+    },
+  });
+  await writeFile(path.join(sessions, `rollout-${now.toISOString().slice(0, 10)}T00-legacy.jsonl`), [
+    cumulative("a", 100, 0),
+    cumulative("b", 160, 1),
+  ].join("\n"));
+  try {
+    const usage = await collectUsage({ days: 7, roots: [sessions], now });
+    assert.equal(usage.today.totalTokens, 160);
+    assert.equal(usage.today.events, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("keeps only the newest active or archived copy of one rollout", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codex-token-dashboard-duplicate-"));
+  const active = path.join(root, "sessions");
+  const archived = path.join(root, "archived_sessions");
+  await mkdir(active, { recursive: true });
+  await mkdir(archived, { recursive: true });
+  const now = new Date();
+  now.setHours(12, 0, 0, 0);
+  const name = `rollout-${now.toISOString().slice(0, 10)}T00-duplicate.jsonl`;
+  const event = (total) => JSON.stringify({
+    timestamp: now.toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      turn_id: "same-turn",
+      info: { last_token_usage: { input_tokens: total - 10, output_tokens: 10, total_tokens: total } },
+    },
+  });
+  const activePath = path.join(active, name);
+  const archivedPath = path.join(archived, name);
+  await writeFile(activePath, event(100));
+  await writeFile(archivedPath, event(150));
+  await utimes(activePath, new Date(now.getTime() - 60_000), new Date(now.getTime() - 60_000));
+  await utimes(archivedPath, now, now);
+  try {
+    const usage = await collectUsage({ days: 7, roots: [active, archived], now });
+    assert.equal(usage.today.totalTokens, 150);
+    assert.equal(usage.today.events, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
