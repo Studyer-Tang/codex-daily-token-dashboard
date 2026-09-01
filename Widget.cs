@@ -6,6 +6,7 @@ using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -43,8 +44,11 @@ internal sealed class TokenWidgetForm : Form
     private readonly NotifyIcon trayIcon;
     private readonly System.Windows.Forms.Timer refreshTimer;
     private readonly ToolTip toolTip;
+    private readonly object logLock = new object();
+    private readonly object recoveryLock = new object();
     private Process ownedServer;
     private bool requestBusy;
+    private bool recoveryBusy;
     private bool allowExit;
     private bool shownTrayHint;
     private bool dataReady;
@@ -61,6 +65,11 @@ internal sealed class TokenWidgetForm : Form
     private double output;
     private double[] dailyValues = new double[0];
     private string[] dailyLabels = new string[0];
+    private readonly string logPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "CodexTokenWidget",
+        "widget.log"
+    );
 
     [DllImport("user32.dll")]
     private static extern bool ReleaseCapture();
@@ -87,6 +96,7 @@ internal sealed class TokenWidgetForm : Form
         var menu = new ContextMenuStrip();
         var showItem = menu.Items.Add("显示悬浮窗");
         var refreshItem = menu.Items.Add("刷新数据");
+        var logItem = menu.Items.Add("打开诊断日志");
         compactMenuItem = (ToolStripMenuItem)menu.Items.Add("极简模式");
         var topItem = (ToolStripMenuItem)menu.Items.Add("始终置顶");
         topItem.Checked = true;
@@ -94,6 +104,7 @@ internal sealed class TokenWidgetForm : Form
         var exitItem = menu.Items.Add("退出");
         showItem.Click += delegate { ShowWidget(); };
         refreshItem.Click += delegate { RequestUsage(); ShowWidget(); };
+        logItem.Click += delegate { OpenLog(); };
         compactMenuItem.Click += delegate { ToggleCompact(); };
         topItem.Click += delegate { TopMost = !TopMost; topItem.Checked = TopMost; Invalidate(); };
         exitItem.Click += delegate { allowExit = true; Close(); };
@@ -111,9 +122,10 @@ internal sealed class TokenWidgetForm : Form
         refreshTimer = new System.Windows.Forms.Timer { Interval = 300000 };
         refreshTimer.Tick += delegate { RequestUsage(); };
         refreshTimer.Start();
-        Shown += delegate { StartUsageService(); RequestUsage(); };
+        Shown += delegate { BeginRecovery("应用启动"); };
         FormClosing += OnFormClosing;
         FormClosed += OnFormClosed;
+        Log("INFO", "悬浮窗启动");
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -365,15 +377,129 @@ internal sealed class TokenWidgetForm : Form
         Invalidate();
     }
 
-    private void StartUsageService()
+    private bool StartUsageService()
     {
-        if (ServiceHealthy()) return;
+        if (ServiceHealthy()) return true;
         try
         {
+            if (ownedServer != null)
+            {
+                if (!ownedServer.HasExited) return true;
+                ownedServer.Dispose();
+                ownedServer = null;
+            }
             var root = AppDomain.CurrentDomain.BaseDirectory;
-            ownedServer = Process.Start(new ProcessStartInfo { FileName = "node.exe", Arguments = "\"" + Path.Combine(root, "server.mjs") + "\"", WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden });
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "node.exe",
+                Arguments = "\"" + Path.Combine(root, "server.mjs") + "\"",
+                WorkingDirectory = root,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8,
+                StandardErrorEncoding = Encoding.UTF8
+            };
+            var serverProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+            ownedServer = serverProcess;
+            serverProcess.OutputDataReceived += delegate(object sender, DataReceivedEventArgs args)
+            {
+                if (!String.IsNullOrWhiteSpace(args.Data)) Log("SERVER", args.Data);
+            };
+            serverProcess.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs args)
+            {
+                if (!String.IsNullOrWhiteSpace(args.Data)) Log("SERVER-ERROR", args.Data);
+            };
+            serverProcess.Exited += delegate(object sender, EventArgs args)
+            {
+                var exitCode = "unknown";
+                try { exitCode = serverProcess.ExitCode.ToString(); } catch { }
+                Log("WARN", "本地统计服务退出，exitCode=" + exitCode);
+                if (allowExit || IsDisposed || !IsHandleCreated) return;
+                try { BeginInvoke(new Action(delegate { BeginRecovery("统计服务意外退出"); })); } catch { }
+            };
+            if (!serverProcess.Start()) throw new InvalidOperationException("Node.js 进程未能启动");
+            serverProcess.BeginOutputReadLine();
+            serverProcess.BeginErrorReadLine();
+            Log("INFO", "已启动本地统计服务，pid=" + serverProcess.Id);
+            return true;
         }
-        catch (Exception error) { SetStatus("Node.js 启动失败", Color.FromArgb(251, 113, 133)); MessageBox.Show(error.Message, "Codex Token 启动失败"); }
+        catch (Exception error)
+        {
+            LogError("启动本地统计服务失败", error);
+            return false;
+        }
+    }
+
+    private void BeginRecovery(string reason)
+    {
+        lock (recoveryLock)
+        {
+            if (recoveryBusy || allowExit || IsDisposed) return;
+            recoveryBusy = true;
+        }
+        SetStatus(
+            reason == "应用启动" ? "正在启动本地统计服务" : reason + " · 正在自动恢复",
+            amber
+        );
+        Log("WARN", "开始自动恢复：" + reason);
+        ThreadPool.QueueUserWorkItem(delegate
+        {
+            Exception lastError = null;
+            for (var attempt = 1; attempt <= 3 && !allowExit; attempt++)
+            {
+                try
+                {
+                    Log("INFO", "自动恢复第 " + attempt + " 次尝试");
+                    if (!StartUsageService()) throw new InvalidOperationException("无法启动 Node.js 本地服务");
+                    for (var check = 0; check < 24 && !allowExit; check++)
+                    {
+                        if (ServiceHealthy())
+                        {
+                            Log("INFO", "本地统计服务已恢复");
+                            BeginInvoke(new Action(delegate
+                            {
+                                lock (recoveryLock) recoveryBusy = false;
+                                SetStatus("服务已恢复 · 正在刷新", cyan);
+                                RequestUsage();
+                            }));
+                            return;
+                        }
+                        Thread.Sleep(250);
+                    }
+                    throw new TimeoutException("本地服务启动后 6 秒内未通过健康检查");
+                }
+                catch (Exception error)
+                {
+                    lastError = error;
+                    LogError("自动恢复第 " + attempt + " 次失败", error);
+                    StopOwnedServer();
+                    Thread.Sleep(attempt * 500);
+                }
+            }
+            if (allowExit) return;
+            try
+            {
+                BeginInvoke(new Action(delegate
+                {
+                    lock (recoveryLock) recoveryBusy = false;
+                    var detail = DescribeError(lastError);
+                    SetStatus(detail + " · 自动恢复失败", Color.FromArgb(251, 113, 133));
+                    toolTip.SetToolTip(this, "错误详情：" + detail + "\n右键托盘图标可打开诊断日志");
+                }));
+            }
+            catch { }
+        });
+    }
+
+    private void StopOwnedServer()
+    {
+        if (ownedServer == null) return;
+        try { if (!ownedServer.HasExited) ownedServer.Kill(); } catch { }
+        try { ownedServer.Dispose(); } catch { }
+        ownedServer = null;
     }
 
     private bool ServiceHealthy()
@@ -390,11 +516,89 @@ internal sealed class TokenWidgetForm : Form
         var client = new WebClient { Encoding = System.Text.Encoding.UTF8 };
         client.DownloadStringCompleted += delegate(object sender, DownloadStringCompletedEventArgs args)
         {
-            try { if (args.Error != null) throw args.Error; RenderUsage(new JavaScriptSerializer().DeserializeObject(args.Result) as Dictionary<string, object>); }
-            catch { SetStatus("读取失败 · 点击刷新重试", Color.FromArgb(251, 113, 133)); }
+            Exception failure = null;
+            try
+            {
+                if (args.Cancelled) throw new WebException("用量请求已取消");
+                if (args.Error != null) throw args.Error;
+                RenderUsage(new JavaScriptSerializer().DeserializeObject(args.Result) as Dictionary<string, object>);
+            }
+            catch (Exception error) { failure = error; }
             finally { requestBusy = false; client.Dispose(); }
+            if (failure != null)
+            {
+                var detail = DescribeError(failure);
+                SetStatus(detail + " · 正在自动重启", Color.FromArgb(251, 113, 133));
+                toolTip.SetToolTip(this, "错误详情：" + detail + "\n正在自动检测并恢复本地服务");
+                LogError("读取用量失败", failure);
+                BeginRecovery(detail);
+            }
         };
         client.DownloadStringAsync(new Uri("http://127.0.0.1:" + Port + "/api/usage?days=30"));
+    }
+
+    private string DescribeError(Exception error)
+    {
+        if (error == null) return "未知错误";
+        var webError = error as WebException;
+        if (webError != null)
+        {
+            if (webError.Status == WebExceptionStatus.ConnectFailure) return "无法连接本地统计服务";
+            if (webError.Status == WebExceptionStatus.Timeout) return "读取本地日志超时";
+            if (webError.Status == WebExceptionStatus.ConnectionClosed) return "本地服务连接意外关闭";
+            if (webError.Status == WebExceptionStatus.ProtocolError)
+            {
+                var response = webError.Response as HttpWebResponse;
+                return response == null
+                    ? "本地服务返回协议错误"
+                    : "本地服务返回 HTTP " + (int)response.StatusCode;
+            }
+        }
+        if (error is InvalidDataException || error is KeyNotFoundException) return "返回的用量数据格式异常";
+        if (error is TimeoutException) return "本地服务启动超时";
+        var message = (error.Message ?? error.GetType().Name).Replace("\r", " ").Replace("\n", " ").Trim();
+        return message.Length > 48 ? message.Substring(0, 47) + "…" : message;
+    }
+
+    private void LogError(string context, Exception error)
+    {
+        Log("ERROR", context + Environment.NewLine + (error == null ? "未知错误" : error.ToString()));
+    }
+
+    private void Log(string level, string message)
+    {
+        try
+        {
+            lock (logLock)
+            {
+                var directory = Path.GetDirectoryName(logPath);
+                Directory.CreateDirectory(directory);
+                if (File.Exists(logPath) && new FileInfo(logPath).Length > 1024 * 1024)
+                {
+                    var previous = logPath + ".1";
+                    if (File.Exists(previous)) File.Delete(previous);
+                    File.Move(logPath, previous);
+                }
+                File.AppendAllText(
+                    logPath,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " [" + level + "] " + message + Environment.NewLine
+                );
+            }
+        }
+        catch { }
+    }
+
+    private void OpenLog()
+    {
+        Log("INFO", "用户打开诊断日志");
+        try
+        {
+            Process.Start(new ProcessStartInfo { FileName = logPath, UseShellExecute = true });
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(error.Message + "\n\n日志位置：" + logPath, "无法打开诊断日志");
+        }
     }
 
     private void RenderUsage(Dictionary<string, object> data)
@@ -427,6 +631,8 @@ internal sealed class TokenWidgetForm : Form
         dailyLabels = labels.ToArray();
         dataReady = true;
         SetStatus("已同步 · " + DateTime.Now.ToString("HH:mm"), cyan);
+        toolTip.SetToolTip(this, "拖动顶部移动 · 右上角可置顶或隐藏");
+        Log("INFO", "用量刷新成功");
     }
 
     private static Dictionary<string, object> Dict(object value) { return value as Dictionary<string, object>; }
@@ -455,10 +661,12 @@ internal sealed class TokenWidgetForm : Form
     private void OnFormClosing(object sender, FormClosingEventArgs e) { if (allowExit) return; e.Cancel = true; HideToTray(); }
     private void OnFormClosed(object sender, FormClosedEventArgs e)
     {
+        allowExit = true;
         refreshTimer.Stop();
         trayIcon.Visible = false;
         trayIcon.Dispose();
-        if (ownedServer != null && !ownedServer.HasExited) ownedServer.Kill();
+        StopOwnedServer();
+        Log("INFO", "悬浮窗退出");
     }
 
     private void UpdateWindowRegion() { using (var path = Rounded(new Rectangle(0, 0, Width, Height), 22)) Region = new Region(path); }
