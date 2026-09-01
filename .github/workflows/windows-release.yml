@@ -19,7 +19,7 @@ jobs:
       - name: Build self-contained package
         shell: powershell
         run: .\scripts\package-windows.ps1 -IncludeBundledNode
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: CodexTokenWidget-windows-x64
           path: dist/*
