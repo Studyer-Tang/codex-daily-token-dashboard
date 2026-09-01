@@ -18,7 +18,7 @@ jobs:
       - run: node --check src/usage-worker.mjs
       - name: Compile Windows widget
         shell: powershell
-        run: Add-Type -Path '.\Widget.cs' -ReferencedAssemblies 'System.Windows.Forms','System.Drawing','System.Web.Extensions' -OutputAssembly '.\CodexTokenWidget.ci.exe' -OutputType WindowsApplication
+        run: Add-Type -Path @('.\Widget.cs','widget\Widget.Models.cs','widget\Widget.Search.cs') -ReferencedAssemblies 'System.Windows.Forms','System.Drawing','System.Web.Extensions' -OutputAssembly '.\CodexTokenWidget.ci.exe' -OutputType WindowsApplication
       - name: Build standalone package
         shell: powershell
         run: .\scripts\package-windows.ps1 -IncludeBundledNode
