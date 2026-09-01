@@ -36,17 +36,17 @@ internal static class Program
 internal sealed class TokenWidgetForm : Form
 {
     private const int Port = 4817;
-    private readonly Color bg = Color.FromArgb(7, 11, 20);
-    private readonly Color surface = Color.FromArgb(16, 24, 39);
-    private readonly Color surfaceHigh = Color.FromArgb(20, 30, 49);
-    private readonly Color border = Color.FromArgb(44, 58, 82);
-    private readonly Color text = Color.FromArgb(248, 250, 252);
-    private readonly Color secondary = Color.FromArgb(160, 174, 196);
-    private readonly Color tertiary = Color.FromArgb(100, 116, 139);
-    private readonly Color blue = Color.FromArgb(96, 165, 250);
-    private readonly Color violet = Color.FromArgb(167, 139, 250);
-    private readonly Color cyan = Color.FromArgb(94, 234, 212);
-    private readonly Color amber = Color.FromArgb(251, 191, 36);
+    private readonly Color bg = Color.FromArgb(20, 22, 24);
+    private readonly Color surface = Color.FromArgb(27, 30, 33);
+    private readonly Color surfaceHigh = Color.FromArgb(35, 38, 42);
+    private readonly Color border = Color.FromArgb(54, 58, 63);
+    private readonly Color text = Color.FromArgb(235, 236, 237);
+    private readonly Color secondary = Color.FromArgb(166, 170, 174);
+    private readonly Color tertiary = Color.FromArgb(112, 117, 122);
+    private readonly Color blue = Color.FromArgb(143, 175, 166);
+    private readonly Color violet = Color.FromArgb(167, 160, 181);
+    private readonly Color cyan = Color.FromArgb(143, 184, 171);
+    private readonly Color amber = Color.FromArgb(196, 166, 106);
     private readonly NotifyIcon trayIcon;
     private readonly System.Windows.Forms.Timer refreshTimer;
     private readonly ToolTip toolTip;
@@ -59,7 +59,7 @@ internal sealed class TokenWidgetForm : Form
     private volatile bool allowExit;
     private bool shownTrayHint;
     private bool dataReady;
-    private bool compactMode;
+    private bool compactMode = true;
     private ToolStripMenuItem compactMenuItem;
     private string statusText = "正在连接本地数据";
     private Color statusColor;
@@ -87,7 +87,7 @@ internal sealed class TokenWidgetForm : Form
     public TokenWidgetForm(EventWaitHandle showSignal)
     {
         Text = "Codex Token Widget";
-        ClientSize = new Size(382, 558);
+        ClientSize = new Size(260, 68);
         FormBorderStyle = FormBorderStyle.None;
         BackColor = bg;
         TopMost = true;
@@ -105,6 +105,7 @@ internal sealed class TokenWidgetForm : Form
         var refreshItem = menu.Items.Add("刷新数据");
         var logItem = menu.Items.Add("打开诊断日志");
         compactMenuItem = (ToolStripMenuItem)menu.Items.Add("极简模式");
+        compactMenuItem.Checked = compactMode;
         var topItem = (ToolStripMenuItem)menu.Items.Add("始终置顶");
         topItem.Checked = true;
         menu.Items.Add(new ToolStripSeparator());
@@ -152,10 +153,10 @@ internal sealed class TokenWidgetForm : Form
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-        using (var page = new LinearGradientBrush(ClientRectangle, Color.FromArgb(13, 20, 35), bg, 55f))
-        using (var path = Rounded(ClientRectangle, 22)) g.FillPath(page, path);
-        using (var outline = new Pen(Color.FromArgb(55, 72, 100)))
-        using (var path = Rounded(new Rectangle(0, 0, Width - 1, Height - 1), 22)) g.DrawPath(outline, path);
+        using (var page = new SolidBrush(bg))
+        using (var path = Rounded(ClientRectangle, compactMode ? 14 : 20)) g.FillPath(page, path);
+        using (var outline = new Pen(border))
+        using (var path = Rounded(new Rectangle(0, 0, Width - 1, Height - 1), compactMode ? 14 : 20)) g.DrawPath(outline, path);
         if (compactMode)
         {
             DrawCompact(g);
@@ -172,15 +173,15 @@ internal sealed class TokenWidgetForm : Form
     private void DrawHeader(Graphics g)
     {
         var iconRect = new Rectangle(18, 16, 34, 34);
-        using (var icon = new LinearGradientBrush(iconRect, blue, violet, 45f)) g.FillEllipse(icon, iconRect);
-        DrawCentered(g, "C", new Font("Segoe UI", 13, FontStyle.Bold), Color.White, iconRect);
-        Draw(g, "CODEX USAGE", 64, 16, 10.5f, text, FontStyle.Bold);
-        Draw(g, "LOCAL ACTIVITY", 64, 35, 7.5f, tertiary, FontStyle.Bold);
+        FillRound(g, iconRect, 9, surfaceHigh);
+        DrawCentered(g, "C", new Font("Segoe UI", 12, FontStyle.Bold), blue, iconRect);
+        Draw(g, "Codex 用量", 64, 16, 10.5f, text, FontStyle.Bold);
+        Draw(g, "仅本机统计", 64, 35, 7.2f, tertiary);
         var compactRect = new Rectangle(251, 17, 28, 28);
         FillRound(g, compactRect, 14, Color.FromArgb(20, 30, 49));
         DrawCentered(g, "–", new Font("Segoe UI", 12, FontStyle.Bold), secondary, compactRect);
         var topRect = new Rectangle(285, 17, 49, 28);
-        FillRound(g, topRect, 14, TopMost ? Color.FromArgb(36, 56, 88) : Color.FromArgb(20, 30, 49));
+        FillRound(g, topRect, 14, TopMost ? Color.FromArgb(43, 53, 50) : surfaceHigh);
         DrawCentered(g, "TOP", new Font("Segoe UI", 7.5f, FontStyle.Bold), TopMost ? blue : tertiary, topRect);
         var closeRect = new Rectangle(340, 17, 28, 28);
         FillRound(g, closeRect, 14, Color.FromArgb(20, 30, 49));
@@ -189,38 +190,34 @@ internal sealed class TokenWidgetForm : Form
 
     private void DrawCompact(Graphics g)
     {
-        var iconRect = new Rectangle(16, 16, 30, 30);
-        using (var icon = new LinearGradientBrush(iconRect, blue, violet, 45f)) g.FillEllipse(icon, iconRect);
-        DrawCentered(g, "C", new Font("Segoe UI", 11, FontStyle.Bold), Color.White, iconRect);
-        Draw(g, "TODAY", 57, 13, 7.5f, secondary, FontStyle.Bold);
-        Draw(g, dataReady ? FormatCompact(todayTotal) : "—", 55, 34, 19, text, FontStyle.Bold);
-        using (var dot = new SolidBrush(statusColor)) g.FillEllipse(dot, 58, 81, 5, 5);
-        Draw(g, statusText, 69, 74, 6.5f, statusColor);
+        Draw(g, "今日用量", 12, 8, 7f, secondary);
+        Draw(g, dataReady ? FormatTiny(todayTotal) : "—", 11, 26, 15.5f, text, FontStyle.Bold);
+        using (var separator = new Pen(border)) g.DrawLine(separator, 96, 11, 96, 56);
+        using (var dot = new SolidBrush(statusColor)) g.FillEllipse(dot, 108, 22, 5, 5);
+        Draw(g, CompactStatusText(), 119, 13, 6.9f, statusColor);
+        Draw(g, "本地 · 5 分钟刷新", 108, 35, 6.2f, tertiary);
 
-        var ring = new Rectangle(241, 37, 52, 52);
-        using (var track = new Pen(Color.FromArgb(40, 55, 78), 6)) g.DrawEllipse(track, ring);
-        if (dataReady)
-        {
-            var mix = Math.Max(1, uncachedInput + cachedInput + output);
-            var cachedPercent = cachedInput / mix * 100;
-            using (var valuePen = new Pen(violet, 6)) { valuePen.StartCap = LineCap.Round; valuePen.EndCap = LineCap.Round; g.DrawArc(valuePen, ring, -90, (float)(cachedPercent * 3.6)); }
-            DrawCentered(g, cachedPercent.ToString("0") + "%", new Font("Segoe UI", 8.5f, FontStyle.Bold), text, ring);
-        }
+        var expandRect = new Rectangle(212, 10, 20, 20);
+        FillRound(g, expandRect, 7, surfaceHigh);
+        DrawCentered(g, "+", new Font("Segoe UI", 9.5f), secondary, expandRect);
+        var closeRect = new Rectangle(238, 10, 14, 20);
+        DrawCentered(g, "×", new Font("Segoe UI", 9.5f), tertiary, closeRect);
+    }
 
-        var expandRect = new Rectangle(278, 8, 26, 24);
-        FillRound(g, expandRect, 12, Color.FromArgb(26, 39, 62));
-        DrawCentered(g, "+", new Font("Segoe UI", 11, FontStyle.Bold), blue, expandRect);
-        var closeRect = new Rectangle(309, 8, 22, 24);
-        FillRound(g, closeRect, 11, Color.FromArgb(20, 30, 49));
-        DrawCentered(g, "×", new Font("Segoe UI", 11), secondary, closeRect);
+    private string CompactStatusText()
+    {
+        if (statusText.StartsWith("已同步")) return statusText;
+        if (statusText.Contains("恢复")) return "正在恢复";
+        if (statusText.Contains("读取") || statusText.Contains("启动") || statusText.Contains("连接")) return "同步中";
+        if (statusText.Contains("失败") || statusText.Contains("错误") || statusText.Contains("超时")) return "连接异常";
+        return statusText.Length > 10 ? statusText.Substring(0, 9) + "…" : statusText;
     }
 
     private void DrawHero(Graphics g)
     {
         var card = new Rectangle(18, 66, 346, 132);
-        using (var cardBrush = new LinearGradientBrush(card, Color.FromArgb(29, 47, 78), Color.FromArgb(18, 28, 48), 15f))
-        using (var path = Rounded(card, 18)) g.FillPath(cardBrush, path);
-        using (var cardBorder = new Pen(Color.FromArgb(54, 79, 119)))
+        FillRound(g, card, 18, surface);
+        using (var cardBorder = new Pen(border))
         using (var path = Rounded(card, 18)) g.DrawPath(cardBorder, path);
         Draw(g, "今日 Token", 35, 83, 8.5f, secondary, FontStyle.Bold);
         Draw(g, dataReady ? FormatCompact(todayTotal) : "—", 34, 105, 27, text, FontStyle.Bold);
@@ -286,7 +283,7 @@ internal sealed class TokenWidgetForm : Form
             var height = Math.Max(4, (int)Math.Round(dailyValues[i] / maximum * chartHeight));
             FillRound(g, new Rectangle(x, chartTop, 22, chartHeight), 8, Color.FromArgb(25, 37, 58));
             var bar = new Rectangle(x, chartTop + chartHeight - height, 22, height);
-            using (var brush = new LinearGradientBrush(bar, blue, violet, 90f)) using (var path = Rounded(bar, 8)) g.FillPath(brush, path);
+            FillRound(g, bar, 8, blue);
             DrawCentered(g, dailyLabels.Length > i ? dailyLabels[i] : "", new Font("Microsoft YaHei UI", 6.5f), i == dailyValues.Length - 1 ? blue : tertiary, new Rectangle(x - 5, 408, 32, 16));
         }
     }
@@ -337,8 +334,8 @@ internal sealed class TokenWidgetForm : Form
         if (e.Button != MouseButtons.Left) return;
         if (compactMode)
         {
-            if (new Rectangle(309, 8, 22, 24).Contains(e.Location)) { HideToTray(); return; }
-            if (new Rectangle(278, 8, 26, 24).Contains(e.Location)) { ToggleCompact(); return; }
+            if (new Rectangle(234, 6, 24, 28).Contains(e.Location)) { HideToTray(); return; }
+            if (new Rectangle(208, 6, 26, 28).Contains(e.Location)) { ToggleCompact(); return; }
             ReleaseCapture();
             SendMessage(Handle, 0xA1, new IntPtr(2), IntPtr.Zero);
             return;
@@ -354,7 +351,7 @@ internal sealed class TokenWidgetForm : Form
     {
         base.OnMouseMove(e);
         var active = compactMode
-            ? new Rectangle(278, 8, 53, 24).Contains(e.Location)
+            ? new Rectangle(208, 6, 50, 28).Contains(e.Location)
             : new Rectangle(251, 17, 117, 28).Contains(e.Location) || new Rectangle(310, 521, 54, 25).Contains(e.Location);
         Cursor = active ? Cursors.Hand : (e.Y < 58 ? Cursors.SizeAll : Cursors.Default);
     }
@@ -389,7 +386,7 @@ internal sealed class TokenWidgetForm : Form
         var top = Top;
         compactMode = !compactMode;
         compactMenuItem.Checked = compactMode;
-        ClientSize = compactMode ? new Size(340, 106) : new Size(382, 558);
+        ClientSize = compactMode ? new Size(260, 68) : new Size(382, 558);
         Location = new Point(right - Width, top);
         UpdateWindowRegion();
         Invalidate();
@@ -706,6 +703,14 @@ internal sealed class TokenWidgetForm : Form
     private static Dictionary<string, object> Dict(object value) { return value as Dictionary<string, object>; }
     private static double Number(object value) { return Convert.ToDouble(value); }
     private static string FormatNumber(double value) { return Math.Round(value).ToString("N0", System.Globalization.CultureInfo.GetCultureInfo("zh-CN")); }
+    private static string FormatTiny(double value)
+    {
+        if (value >= 100000000) return (value / 100000000).ToString("0.#") + "亿";
+        if (value >= 1000000) return Math.Round(value / 10000).ToString("0") + "万";
+        if (value >= 10000) return (value / 10000).ToString("0.#") + "万";
+        return Math.Round(value).ToString("N0", System.Globalization.CultureInfo.GetCultureInfo("zh-CN"));
+    }
+
     private static string FormatCompact(double value)
     {
         if (value >= 100000000) return (value / 100000000).ToString("0.##") + " 亿";
@@ -749,7 +754,11 @@ internal sealed class TokenWidgetForm : Form
         Log("INFO", "悬浮窗退出");
     }
 
-    private void UpdateWindowRegion() { using (var path = Rounded(new Rectangle(0, 0, Width, Height), 22)) Region = new Region(path); }
+    private void UpdateWindowRegion()
+    {
+        using (var path = Rounded(new Rectangle(0, 0, Width, Height), compactMode ? 14 : 20))
+            Region = new Region(path);
+    }
 
     private static GraphicsPath Rounded(Rectangle rect, int radius)
     {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import test from "node:test";
@@ -22,6 +23,22 @@ async function close(server) {
   await new Promise((resolve) => server.close(resolve));
 }
 
+function getJson(url, timeoutMilliseconds = 1_000) {
+  return new Promise((resolve, reject) => {
+    const request = http.get(url, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("end", () => {
+        try { resolve({ status: response.statusCode, body: JSON.parse(body) }); }
+        catch (error) { reject(error); }
+      });
+    });
+    request.setTimeout(timeoutMilliseconds, () => request.destroy(new Error("request timed out")));
+    request.on("error", reject);
+  });
+}
+
 test("health stays responsive while a usage request is still running", async () => {
   let finishUsage;
   const usageClient = {
@@ -32,12 +49,12 @@ test("health stays responsive while a usage request is still running", async () 
   const server = createDashboardServer({ usageClient, logger: { error() {} } });
   const origin = await listen(server);
   try {
-    const usageRequest = fetch(`${origin}/api/usage?days=30`);
+    const usageRequest = getJson(`${origin}/api/usage?days=30`);
     await new Promise((resolve) => setImmediate(resolve));
     const startedAt = performance.now();
-    const health = await fetch(`${origin}/api/health`, { signal: AbortSignal.timeout(1_000) });
+    const health = await getJson(`${origin}/api/health`);
     assert.equal(health.status, 200);
-    assert.equal((await health.json()).service, "codex-daily-token-dashboard");
+    assert.equal(health.body.service, "codex-daily-token-dashboard");
     assert.ok(performance.now() - startedAt < 500);
     finishUsage({ ok: true });
     assert.equal((await usageRequest).status, 200);
@@ -55,9 +72,9 @@ test("usage failures return a safe structured detail", async () => {
   const server = createDashboardServer({ usageClient, logger: { error() {} } });
   const origin = await listen(server);
   try {
-    const response = await fetch(`${origin}/api/usage?days=30`);
+    const response = await getJson(`${origin}/api/usage?days=30`);
     assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), {
+    assert.deepEqual(response.body, {
       error: "读取本地 Codex 用量失败",
       detail: "synthetic scan failure",
     });
@@ -75,7 +92,7 @@ test("API error details redact the user profile path", async () => {
   const server = createDashboardServer({ usageClient, logger: { error() {} } });
   const origin = await listen(server);
   try {
-    const payload = await (await fetch(`${origin}/api/usage`)).json();
+    const payload = (await getJson(`${origin}/api/usage`)).body;
     assert.doesNotMatch(payload.detail, new RegExp(os.homedir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(payload.detail, /%USERPROFILE%/);
   } finally {

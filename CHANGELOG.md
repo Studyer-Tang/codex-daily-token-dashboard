@@ -9,3 +9,4 @@
 - Added a self-contained Windows ZIP with bundled Node.js and a SHA-256 checksum.
 - Replaced committed binaries with reproducible GitHub Actions build artifacts.
 - Expanded automated coverage for cumulative logs, duplicate archives, worker stalls, port conflicts, and parent-process exit.
+- Replaced the decorative blue-purple compact card with a default 260×68 flat, neutral reading companion.
