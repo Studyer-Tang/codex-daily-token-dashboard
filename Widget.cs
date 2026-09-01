@@ -60,6 +60,11 @@ internal sealed class TokenWidgetForm : Form
     private bool shownTrayHint;
     private bool dataReady;
     private bool compactMode = true;
+    private bool taskView;
+    private bool taskRequestBusy;
+    private int selectedTaskIndex = -1;
+    private int taskScroll;
+    private int turnScroll;
     private ToolStripMenuItem compactMenuItem;
     private string statusText = "正在连接本地数据";
     private Color statusColor;
@@ -72,11 +77,39 @@ internal sealed class TokenWidgetForm : Form
     private double output;
     private double[] dailyValues = new double[0];
     private string[] dailyLabels = new string[0];
+    private List<UsageTask> usageTasks = new List<UsageTask>();
     private readonly string logPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "CodexTokenWidget",
         "widget.log"
     );
+
+    private sealed class UsageTask
+    {
+        public string Id = "";
+        public string Label = "匿名任务";
+        public string LastActivity = "";
+        public double TotalTokens;
+        public double InputTokens;
+        public double CachedInputTokens;
+        public double OutputTokens;
+        public int TurnCount;
+        public bool DetailsLoaded;
+        public bool DetailsLoading;
+        public string DetailError = "";
+        public List<UsageTurn> Turns = new List<UsageTurn>();
+    }
+
+    private sealed class UsageTurn
+    {
+        public int Number;
+        public string Timestamp = "";
+        public bool Identified;
+        public double TotalTokens;
+        public double InputTokens;
+        public double CachedInputTokens;
+        public double OutputTokens;
+    }
 
     [DllImport("user32.dll")]
     private static extern bool ReleaseCapture();
@@ -163,6 +196,12 @@ internal sealed class TokenWidgetForm : Form
             return;
         }
         DrawHeader(g);
+        if (taskView)
+        {
+            DrawTaskPanel(g);
+            DrawFooter(g);
+            return;
+        }
         DrawHero(g);
         DrawSummary(g);
         DrawTrend(g);
@@ -177,6 +216,12 @@ internal sealed class TokenWidgetForm : Form
         DrawCentered(g, "C", new Font("Segoe UI", 12, FontStyle.Bold), blue, iconRect);
         Draw(g, "Codex 用量", 64, 16, 10.5f, text, FontStyle.Bold);
         Draw(g, "仅本机统计", 64, 35, 7.2f, tertiary);
+        var overviewRect = new Rectangle(165, 18, 38, 26);
+        var tasksRect = new Rectangle(207, 18, 38, 26);
+        FillRound(g, overviewRect, 8, taskView ? bg : surfaceHigh);
+        FillRound(g, tasksRect, 8, taskView ? surfaceHigh : bg);
+        DrawCentered(g, "概览", new Font("Microsoft YaHei UI", 6.5f, FontStyle.Bold), taskView ? tertiary : text, overviewRect);
+        DrawCentered(g, "任务", new Font("Microsoft YaHei UI", 6.5f, FontStyle.Bold), taskView ? text : tertiary, tasksRect);
         var compactRect = new Rectangle(251, 17, 28, 28);
         FillRound(g, compactRect, 14, Color.FromArgb(20, 30, 49));
         DrawCentered(g, "–", new Font("Segoe UI", 12, FontStyle.Bold), secondary, compactRect);
@@ -313,6 +358,106 @@ internal sealed class TokenWidgetForm : Form
         DrawLegend(g, 258, 496, cyan, "输出 " + FormatCompact(output));
     }
 
+    private void DrawTaskPanel(Graphics g)
+    {
+        if (selectedTaskIndex >= 0 && selectedTaskIndex < usageTasks.Count)
+            DrawTaskDetail(g, usageTasks[selectedTaskIndex]);
+        else
+            DrawTaskList(g);
+    }
+
+    private void DrawTaskList(Graphics g)
+    {
+        Draw(g, "任务用量排行", 18, 68, 10.5f, text, FontStyle.Bold);
+        var totalTurns = 0;
+        foreach (var task in usageTasks) totalTurns += task.TurnCount;
+        Draw(g, usageTasks.Count + " 个任务 · " + totalTurns + " 轮", 18, 91, 7, tertiary);
+        var visible = 7;
+        var end = Math.Min(usageTasks.Count, taskScroll + visible);
+        DrawRight(g, usageTasks.Count > visible ? (taskScroll + 1) + "–" + end + " / " + usageTasks.Count + " · 滚轮浏览" : "点击查看每轮明细", 364, 91, 6.2f, tertiary);
+        if (!dataReady)
+        {
+            DrawCentered(g, "正在读取本地任务记录", new Font("Microsoft YaHei UI", 8), secondary, new Rectangle(18, 190, 346, 80));
+            return;
+        }
+        if (usageTasks.Count == 0)
+        {
+            DrawCentered(g, "当前范围内没有任务记录", new Font("Microsoft YaHei UI", 8), secondary, new Rectangle(18, 190, 346, 80));
+            return;
+        }
+        var maximum = Math.Max(1, usageTasks[0].TotalTokens);
+        taskScroll = Math.Max(0, Math.Min(taskScroll, Math.Max(0, usageTasks.Count - visible)));
+        for (var slot = 0; slot < visible; slot++)
+        {
+            var index = taskScroll + slot;
+            if (index >= usageTasks.Count) break;
+            var task = usageTasks[index];
+            var rect = new Rectangle(18, 116 + slot * 58, 346, 52);
+            FillRound(g, rect, 11, surface);
+            using (var p = new Pen(border)) using (var path = Rounded(rect, 11)) g.DrawPath(p, path);
+            DrawCentered(g, (index + 1).ToString("00"), new Font("Segoe UI", 6.5f), tertiary, new Rectangle(rect.X + 4, rect.Y, 28, rect.Height));
+            Draw(g, task.Label, rect.X + 36, rect.Y + 7, 8, text, FontStyle.Bold);
+            Draw(g, task.TurnCount + " 轮 · " + FormatActivity(task.LastActivity), rect.X + 36, rect.Y + 25, 6.2f, tertiary);
+            DrawRight(g, FormatCompact(task.TotalTokens), rect.Right - 13, rect.Y + 8, 8.5f, text);
+            var bar = new Rectangle(rect.X + 36, rect.Bottom - 8, 210, 3);
+            FillRound(g, bar, 2, surfaceHigh);
+            var width = Math.Max(2, (int)Math.Round(task.TotalTokens / maximum * bar.Width));
+            FillRound(g, new Rectangle(bar.X, bar.Y, width, bar.Height), 2, blue);
+            DrawRight(g, "›", rect.Right - 12, rect.Y + 27, 8, tertiary);
+        }
+    }
+
+    private void DrawTaskDetail(Graphics g, UsageTask task)
+    {
+        var back = new Rectangle(18, 67, 34, 25);
+        FillRound(g, back, 8, surfaceHigh);
+        DrawCentered(g, "‹", new Font("Segoe UI", 12), secondary, back);
+        Draw(g, task.Label, 61, 68, 10, text, FontStyle.Bold);
+        Draw(g, task.TurnCount + " 轮 · " + FormatActivity(task.LastActivity), 61, 88, 6.5f, tertiary);
+        if (task.DetailsLoaded && task.Turns.Count > 6)
+            DrawRight(g, (turnScroll + 1) + "–" + Math.Min(task.Turns.Count, turnScroll + 6) + " / " + task.Turns.Count, 364, 88, 6.2f, tertiary);
+
+        var summary = new Rectangle(18, 105, 346, 52);
+        FillRound(g, summary, 11, surface);
+        using (var p = new Pen(border)) using (var path = Rounded(summary, 11)) g.DrawPath(p, path);
+        Draw(g, "总量", 32, 115, 6.5f, tertiary);
+        Draw(g, FormatCompact(task.TotalTokens), 31, 130, 10, text, FontStyle.Bold);
+        Draw(g, "输入 " + FormatCompact(task.InputTokens), 143, 117, 6.5f, secondary);
+        Draw(g, "缓存 " + FormatCompact(task.CachedInputTokens), 143, 135, 6.5f, secondary);
+        Draw(g, "输出 " + FormatCompact(task.OutputTokens), 260, 126, 6.5f, secondary);
+
+        if (task.DetailsLoading)
+        {
+            DrawCentered(g, "正在读取每轮用量…", new Font("Microsoft YaHei UI", 8), secondary, new Rectangle(18, 220, 346, 80));
+            return;
+        }
+        if (!String.IsNullOrWhiteSpace(task.DetailError))
+        {
+            DrawCentered(g, task.DetailError + "\n点击此处重试", new Font("Microsoft YaHei UI", 8), Color.FromArgb(251, 113, 133), new Rectangle(18, 220, 346, 80));
+            return;
+        }
+        if (!task.DetailsLoaded || task.Turns.Count == 0)
+        {
+            DrawCentered(g, task.DetailsLoaded ? "没有可显示的轮次" : "点击任务后读取轮次", new Font("Microsoft YaHei UI", 8), secondary, new Rectangle(18, 220, 346, 80));
+            return;
+        }
+        var visible = 6;
+        turnScroll = Math.Max(0, Math.Min(turnScroll, Math.Max(0, task.Turns.Count - visible)));
+        for (var slot = 0; slot < visible; slot++)
+        {
+            var index = turnScroll + slot;
+            if (index >= task.Turns.Count) break;
+            var turn = task.Turns[index];
+            var y = 166 + slot * 57;
+            var rect = new Rectangle(18, y, 346, 51);
+            FillRound(g, rect, 9, index % 2 == 0 ? surface : bg);
+            Draw(g, turn.Identified ? "第 " + turn.Number + " 轮" : "未标记轮次", rect.X + 12, rect.Y + 7, 7.2f, text, FontStyle.Bold);
+            Draw(g, FormatActivity(turn.Timestamp), rect.X + 12, rect.Y + 26, 6f, tertiary);
+            DrawRight(g, FormatCompact(turn.TotalTokens), rect.Right - 12, rect.Y + 7, 8, text);
+            DrawRight(g, "输入 " + FormatTiny(turn.InputTokens) + " · 缓存 " + FormatTiny(turn.CachedInputTokens) + " · 输出 " + FormatTiny(turn.OutputTokens), rect.Right - 12, rect.Y + 27, 5.8f, tertiary);
+        }
+    }
+
     private void DrawLegend(Graphics g, int x, int y, Color color, string value)
     {
         using (var brush = new SolidBrush(color)) g.FillEllipse(brush, x, y + 4, 6, 6);
@@ -343,7 +488,42 @@ internal sealed class TokenWidgetForm : Form
         if (new Rectangle(340, 17, 28, 28).Contains(e.Location)) { HideToTray(); return; }
         if (new Rectangle(251, 17, 28, 28).Contains(e.Location)) { ToggleCompact(); return; }
         if (new Rectangle(285, 17, 49, 28).Contains(e.Location)) { TopMost = !TopMost; Invalidate(); return; }
+        if (new Rectangle(165, 18, 38, 26).Contains(e.Location)) { taskView = false; selectedTaskIndex = -1; Invalidate(); return; }
+        if (new Rectangle(207, 18, 38, 26).Contains(e.Location)) { taskView = true; selectedTaskIndex = -1; Invalidate(); return; }
         if (new Rectangle(310, 521, 54, 25).Contains(e.Location)) { RequestUsage(); return; }
+        if (taskView)
+        {
+            if (selectedTaskIndex >= 0)
+            {
+                if (new Rectangle(18, 67, 34, 25).Contains(e.Location))
+                {
+                    selectedTaskIndex = -1;
+                    turnScroll = 0;
+                    Invalidate();
+                    return;
+                }
+                var selected = selectedTaskIndex < usageTasks.Count ? usageTasks[selectedTaskIndex] : null;
+                if (selected != null && !selected.DetailsLoading && (!selected.DetailsLoaded || !String.IsNullOrWhiteSpace(selected.DetailError)) && new Rectangle(18, 170, 346, 250).Contains(e.Location))
+                {
+                    RequestTaskDetails(selected);
+                    return;
+                }
+            }
+            else if (e.Y >= 116 && e.Y < 522)
+            {
+                var slot = (e.Y - 116) / 58;
+                var index = taskScroll + slot;
+                var rowTop = 116 + slot * 58;
+                if (slot >= 0 && slot < 7 && index < usageTasks.Count && new Rectangle(18, rowTop, 346, 52).Contains(e.Location))
+                {
+                    selectedTaskIndex = index;
+                    turnScroll = 0;
+                    Invalidate();
+                    RequestTaskDetails(usageTasks[index]);
+                    return;
+                }
+            }
+        }
         if (e.Y < 58) { ReleaseCapture(); SendMessage(Handle, 0xA1, new IntPtr(2), IntPtr.Zero); }
     }
 
@@ -352,8 +532,27 @@ internal sealed class TokenWidgetForm : Form
         base.OnMouseMove(e);
         var active = compactMode
             ? new Rectangle(208, 6, 50, 28).Contains(e.Location)
-            : new Rectangle(251, 17, 117, 28).Contains(e.Location) || new Rectangle(310, 521, 54, 25).Contains(e.Location);
+            : new Rectangle(165, 17, 203, 28).Contains(e.Location) || new Rectangle(310, 521, 54, 25).Contains(e.Location) ||
+                (taskView && selectedTaskIndex < 0 && e.Y >= 116 && e.Y < 522) ||
+                (taskView && selectedTaskIndex >= 0 && new Rectangle(18, 67, 34, 25).Contains(e.Location));
         Cursor = active ? Cursors.Hand : (e.Y < 58 ? Cursors.SizeAll : Cursors.Default);
+    }
+
+    protected override void OnMouseWheel(MouseEventArgs e)
+    {
+        base.OnMouseWheel(e);
+        if (compactMode || !taskView) return;
+        var direction = e.Delta > 0 ? -3 : 3;
+        if (selectedTaskIndex >= 0 && selectedTaskIndex < usageTasks.Count)
+        {
+            var task = usageTasks[selectedTaskIndex];
+            turnScroll = Math.Max(0, Math.Min(Math.Max(0, task.Turns.Count - 6), turnScroll + direction));
+        }
+        else
+        {
+            taskScroll = Math.Max(0, Math.Min(Math.Max(0, usageTasks.Count - 7), taskScroll + direction));
+        }
+        Invalidate();
     }
 
     protected override void OnMouseDoubleClick(MouseEventArgs e)
@@ -558,7 +757,7 @@ internal sealed class TokenWidgetForm : Form
                     throw new TimeoutException("读取用量请求超过 50 秒");
                 if (args.Cancelled) throw new WebException("用量请求已取消");
                 if (args.Error != null) throw args.Error;
-                RenderUsage(new JavaScriptSerializer().DeserializeObject(args.Result) as Dictionary<string, object>);
+                RenderUsage(DeserializePayload(args.Result));
             }
             catch (Exception error) { failure = error; }
             finally { requestBusy = false; timeoutTimer.Dispose(); client.Dispose(); }
@@ -571,7 +770,70 @@ internal sealed class TokenWidgetForm : Form
                 BeginRecovery(detail);
             }
         };
-        client.DownloadStringAsync(new Uri("http://127.0.0.1:" + Port + "/api/usage?days=30"));
+        client.DownloadStringAsync(new Uri("http://127.0.0.1:" + Port + "/api/usage?days=30&taskDetail=summary"));
+    }
+
+    private void RequestTaskDetails(UsageTask task)
+    {
+        if (task == null || taskRequestBusy || task.DetailsLoading) return;
+        if (task.DetailsLoaded && String.IsNullOrWhiteSpace(task.DetailError)) return;
+        taskRequestBusy = true;
+        task.DetailsLoading = true;
+        task.DetailError = "";
+        Invalidate();
+        var client = new WebClient { Encoding = Encoding.UTF8 };
+        var timedOut = 0;
+        var timeoutTimer = new System.Threading.Timer(
+            delegate(object state)
+            {
+                Interlocked.Exchange(ref timedOut, 1);
+                try { client.CancelAsync(); } catch { }
+            },
+            null,
+            50000,
+            Timeout.Infinite
+        );
+        client.DownloadStringCompleted += delegate(object sender, DownloadStringCompletedEventArgs args)
+        {
+            Exception failure = null;
+            try
+            {
+                if (args.Cancelled && Interlocked.CompareExchange(ref timedOut, 0, 0) == 1)
+                    throw new TimeoutException("读取任务轮次超过 50 秒");
+                if (args.Cancelled) throw new WebException("任务轮次请求已取消");
+                if (args.Error != null) throw args.Error;
+                var data = DeserializePayload(args.Result);
+                var items = data != null && data.ContainsKey("tasks") ? data["tasks"] as object[] : null;
+                if (items == null || items.Length == 0) throw new InvalidDataException("未找到任务轮次");
+                var detail = ParseUsageTask(Dict(items[0]), false);
+                task.Turns = detail.Turns;
+                task.TurnCount = detail.TurnCount;
+                task.DetailsLoaded = true;
+                Log("INFO", "任务轮次读取成功：" + task.Id);
+            }
+            catch (Exception error) { failure = error; }
+            finally
+            {
+                task.DetailsLoading = false;
+                taskRequestBusy = false;
+                timeoutTimer.Dispose();
+                client.Dispose();
+            }
+            if (failure != null)
+            {
+                task.DetailError = ShortMessage(DescribeError(failure), 30);
+                LogError("读取任务轮次失败", failure);
+            }
+            Invalidate();
+        };
+        var url = "http://127.0.0.1:" + Port + "/api/usage?days=30&task=" + Uri.EscapeDataString(task.Id);
+        client.DownloadStringAsync(new Uri(url));
+    }
+
+    private static Dictionary<string, object> DeserializePayload(string json)
+    {
+        var serializer = new JavaScriptSerializer { MaxJsonLength = 64 * 1024 * 1024, RecursionLimit = 128 };
+        return serializer.DeserializeObject(json) as Dictionary<string, object>;
     }
 
     private string DescribeError(Exception error)
@@ -694,14 +956,86 @@ internal sealed class TokenWidgetForm : Form
         }
         dailyValues = values.ToArray();
         dailyLabels = labels.ToArray();
+        var selectedId = selectedTaskIndex >= 0 && selectedTaskIndex < usageTasks.Count ? usageTasks[selectedTaskIndex].Id : "";
+        var previous = new Dictionary<string, UsageTask>();
+        foreach (var existing in usageTasks) if (!String.IsNullOrWhiteSpace(existing.Id)) previous[existing.Id] = existing;
+        var parsedTasks = new List<UsageTask>();
+        var rawTasks = data.ContainsKey("tasks") ? data["tasks"] as object[] : null;
+        if (rawTasks != null)
+        {
+            foreach (var rawTask in rawTasks)
+            {
+                var parsed = ParseUsageTask(Dict(rawTask), true);
+                UsageTask existing;
+                if (previous.TryGetValue(parsed.Id, out existing))
+                {
+                    existing.Label = parsed.Label;
+                    existing.LastActivity = parsed.LastActivity;
+                    existing.TotalTokens = parsed.TotalTokens;
+                    existing.InputTokens = parsed.InputTokens;
+                    existing.CachedInputTokens = parsed.CachedInputTokens;
+                    existing.OutputTokens = parsed.OutputTokens;
+                    existing.TurnCount = parsed.TurnCount;
+                    parsedTasks.Add(existing);
+                }
+                else parsedTasks.Add(parsed);
+            }
+        }
+        usageTasks = parsedTasks;
+        selectedTaskIndex = -1;
+        if (!String.IsNullOrWhiteSpace(selectedId))
+            for (var i = 0; i < usageTasks.Count; i++) if (usageTasks[i].Id == selectedId) { selectedTaskIndex = i; break; }
+        taskScroll = Math.Max(0, Math.Min(taskScroll, Math.Max(0, usageTasks.Count - 7)));
         dataReady = true;
         SetStatus("已同步 · " + DateTime.Now.ToString("HH:mm"), cyan);
         toolTip.SetToolTip(this, "拖动顶部移动 · 右上角可置顶或隐藏");
         Log("INFO", "用量刷新成功");
     }
 
+    private static UsageTask ParseUsageTask(Dictionary<string, object> item, bool summaryOnly)
+    {
+        if (item == null) throw new InvalidDataException("任务数据格式异常");
+        var task = new UsageTask
+        {
+            Id = TextValue(item, "id"),
+            Label = TextValue(item, "label"),
+            LastActivity = TextValue(item, "lastActivity"),
+            TotalTokens = NumberValue(item, "totalTokens"),
+            InputTokens = NumberValue(item, "inputTokens"),
+            CachedInputTokens = NumberValue(item, "cachedInputTokens"),
+            OutputTokens = NumberValue(item, "outputTokens")
+        };
+        if (String.IsNullOrWhiteSpace(task.Label)) task.Label = "匿名任务";
+        var rawTurns = item.ContainsKey("turns") ? item["turns"] as object[] : null;
+        task.TurnCount = item.ContainsKey("turnCount") ? (int)Math.Round(Number(item["turnCount"])) : rawTurns == null ? 0 : rawTurns.Length;
+        if (!summaryOnly && rawTurns != null)
+        {
+            foreach (var rawTurn in rawTurns)
+            {
+                var turn = Dict(rawTurn);
+                if (turn == null) continue;
+                task.Turns.Add(new UsageTurn
+                {
+                    Number = (int)Math.Round(NumberValue(turn, "number")),
+                    Timestamp = TextValue(turn, "timestamp"),
+                    Identified = BooleanValue(turn, "identified"),
+                    TotalTokens = NumberValue(turn, "totalTokens"),
+                    InputTokens = NumberValue(turn, "inputTokens"),
+                    CachedInputTokens = NumberValue(turn, "cachedInputTokens"),
+                    OutputTokens = NumberValue(turn, "outputTokens")
+                });
+            }
+            task.TurnCount = task.Turns.Count;
+            task.DetailsLoaded = true;
+        }
+        return task;
+    }
+
     private static Dictionary<string, object> Dict(object value) { return value as Dictionary<string, object>; }
     private static double Number(object value) { return Convert.ToDouble(value); }
+    private static double NumberValue(Dictionary<string, object> item, string key) { return item != null && item.ContainsKey(key) ? Number(item[key]) : 0; }
+    private static string TextValue(Dictionary<string, object> item, string key) { return item != null && item.ContainsKey(key) ? Convert.ToString(item[key]) : ""; }
+    private static bool BooleanValue(Dictionary<string, object> item, string key) { return item != null && item.ContainsKey(key) && Convert.ToBoolean(item[key]); }
     private static string FormatNumber(double value) { return Math.Round(value).ToString("N0", System.Globalization.CultureInfo.GetCultureInfo("zh-CN")); }
     private static string FormatTiny(double value)
     {
@@ -716,6 +1050,12 @@ internal sealed class TokenWidgetForm : Form
         if (value >= 100000000) return (value / 100000000).ToString("0.##") + " 亿";
         if (value >= 10000) return (value / 10000).ToString("0.##") + " 万";
         return FormatNumber(value);
+    }
+
+    private static string FormatActivity(string value)
+    {
+        DateTime timestamp;
+        return DateTime.TryParse(value, out timestamp) ? timestamp.ToLocalTime().ToString("MM/dd HH:mm") : "时间未知";
     }
 
     private void SetStatus(string value, Color color) { statusText = value; statusColor = color; Invalidate(); }

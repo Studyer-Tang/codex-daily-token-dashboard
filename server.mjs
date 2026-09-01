@@ -32,6 +32,20 @@ function safeErrorDetail(error) {
   return message.length > 240 ? `${message.slice(0, 239)}…` : message;
 }
 
+export function selectUsageDetails(usage, { taskDetail = "full", taskId = "" } = {}) {
+  if (!Array.isArray(usage?.tasks)) return usage;
+  if (taskId) {
+    return { ...usage, tasks: usage.tasks.filter((task) => task.id === taskId) };
+  }
+  if (taskDetail === "summary") {
+    return {
+      ...usage,
+      tasks: usage.tasks.map(({ turns = [], ...task }) => ({ ...task, turnCount: turns.length })),
+    };
+  }
+  return usage;
+}
+
 export class UsageWorkerClient {
   constructor({
     timeoutMilliseconds = 45_000,
@@ -127,7 +141,11 @@ export function createDashboardServer({
       }
       if (url.pathname === "/api/usage") {
         const days = Math.max(7, Math.min(365, Number(url.searchParams.get("days")) || 30));
-        return sendJson(response, 200, await usageClient.request(days));
+        const usage = await usageClient.request(days);
+        return sendJson(response, 200, selectUsageDetails(usage, {
+          taskDetail: url.searchParams.get("taskDetail") || "full",
+          taskId: url.searchParams.get("task") || "",
+        }));
       }
       const asset = staticFiles.get(url.pathname);
       if (!asset) return sendJson(response, 404, { error: "Not found" });

@@ -7,7 +7,7 @@ import os from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { createDashboardServer, UsageWorkerClient } from "../server.mjs";
+import { createDashboardServer, selectUsageDetails, UsageWorkerClient } from "../server.mjs";
 
 const serverPath = fileURLToPath(new URL("../server.mjs", import.meta.url));
 
@@ -38,6 +38,22 @@ function getJson(url, timeoutMilliseconds = 1_000) {
     request.on("error", reject);
   });
 }
+
+test("returns task summaries without turn payloads and selects one task on demand", () => {
+  const usage = {
+    today: { totalTokens: 30 },
+    tasks: [
+      { id: "task-a", label: "任务 A", totalTokens: 20, turns: [{ totalTokens: 20 }] },
+      { id: "task-b", label: "任务 B", totalTokens: 10, turns: [{ totalTokens: 4 }, { totalTokens: 6 }] },
+    ],
+  };
+  const summary = selectUsageDetails(usage, { taskDetail: "summary" });
+  assert.equal(summary.tasks[0].turnCount, 1);
+  assert.equal(summary.tasks[1].turnCount, 2);
+  assert.equal("turns" in summary.tasks[0], false);
+  assert.deepEqual(selectUsageDetails(usage, { taskId: "task-b" }).tasks, [usage.tasks[1]]);
+  assert.equal(usage.tasks[0].turns.length, 1);
+});
 
 test("health stays responsive while a usage request is still running", async () => {
   let finishUsage;

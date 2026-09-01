@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 - 2026-09-01
+
+- Added native task rankings and per-turn usage details to the expanded Windows floating panel.
+- Added Overview and Tasks views without changing the 260×68 compact reading bar.
+- Added mouse-wheel navigation, on-demand turn loading, back navigation, and retry feedback.
+- Added summary-only and single-task API responses so the widget never downloads every turn during routine refreshes.
+
 ## 1.2.0 - 2026-09-01
 
 - Added privacy-preserving usage totals for each task and conversation turn.
