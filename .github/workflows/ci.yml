@@ -16,9 +16,17 @@ jobs:
       - run: node --check server.mjs
       - run: node --check src/usage.mjs
       - run: node --check src/usage-worker.mjs
+      - run: node --check src/usage-query.mjs
+      - run: node --check public/app.js
+      - run: node --check scripts/stop-dashboard.mjs
       - name: Compile Windows widget
         shell: powershell
         run: Add-Type -Path @('.\Widget.cs','widget\Widget.Models.cs','widget\Widget.Search.cs') -ReferencedAssemblies 'System.Windows.Forms','System.Drawing','System.Web.Extensions' -OutputAssembly '.\CodexTokenWidget.ci.exe' -OutputType WindowsApplication
       - name: Build standalone package
         shell: powershell
         run: .\scripts\package-windows.ps1 -IncludeBundledNode
+      - name: Test native model cache invalidation
+        shell: powershell
+        run: .\scripts\test-widget-model.ps1
+      - name: Smoke test packaged runtime
+        run: node scripts/smoke-package.mjs

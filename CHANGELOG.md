@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.0 - 2026-09-07
+
+- Correct multiple-call turn accounting, repeated cumulative events, cross-day attribution and independent 30-day totals.
+- Add source/timezone-isolated compressed snapshots, persistent incremental checkpoints and honest stale-data reporting.
+- Move query indexing, selection and pagination into the Worker; bound its queue and support long first scans.
+- Authenticate local APIs and verify request origins; replace port-based process killing with verified graceful shutdown.
+- Invalidate native task details by revision, reject stale responses and preserve focused turns across refreshes.
+- Load web task summaries and turn pages on demand; handle request races/timeouts and remove CSP-blocked inline styles.
+- Preserve old executables until successful compilation, validate packaged Node architecture/version, and fix quoted-path startup.
+- Correct privacy documentation and require Node.js 22.13 or newer.
+
 ## 1.5.2 - 2026-09-01
 
 - Discover Codex records from `CODEX_HOME` when configured, otherwise from the current user's profile.

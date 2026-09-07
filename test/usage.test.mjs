@@ -54,7 +54,7 @@ test("normalizes Codex usage without double-counting cached input", () => {
   });
 });
 
-test("aggregates last_token_usage by local day and deduplicates turn ids", async () => {
+test("aggregates last_token_usage by local day and deduplicates identical events", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "codex-token-dashboard-test-"));
   const sessions = path.join(root, "sessions");
   await mkdir(sessions, { recursive: true });
@@ -79,7 +79,7 @@ test("aggregates last_token_usage by local day and deduplicates turn ids", async
   });
   await writeFile(path.join(sessions, `rollout-${timestamp.toISOString().slice(0, 10)}T00-00-00-test.jsonl`), [
     event("turn-1", 100),
-    event("turn-1", 100, 1),
+    event("turn-1", 100),
     event("turn-2", 50, 2),
   ].join("\n"));
   try {

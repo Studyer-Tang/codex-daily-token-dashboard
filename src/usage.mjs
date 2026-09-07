@@ -1,40 +1,27 @@
 import { createReadStream } from "node:fs";
-import { mkdir, opendir, readFile, stat, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { mkdir, opendir, readFile, stat, writeFile, rename, open, unlink } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
-import { StringDecoder } from "node:string_decoder";
-import { fileURLToPath } from "node:url";
+import { gzip, gunzip } from "node:zlib";
+import { promisify } from "node:util";
+const compress = promisify(gzip), decompress = promisify(gunzip);
 
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
-const fileCache = new Map();
-let ripgrepSnapshot = null;
-let snapshotRefresh = null;
-let snapshotLoaded = false;
+const SNAPSHOT_VERSION = 10;
+const TTL = 4 * 60_000;
 let threadMetadataCache = { loadedAt: 0, titles: new Map(), roots: new Map() };
-function applicationCacheDirectory() {
+
+export function applicationCacheDirectory() {
   if (process.env.CODEX_TOKEN_CACHE_DIR) return path.resolve(process.env.CODEX_TOKEN_CACHE_DIR);
-  if (process.platform === "win32" && process.env.LOCALAPPDATA) {
-    return path.join(process.env.LOCALAPPDATA, "CodexTokenWidget");
-  }
-  if (process.env.XDG_CACHE_HOME) return path.join(process.env.XDG_CACHE_HOME, "codex-token-widget");
-  return path.join(os.homedir(), ".cache", "codex-token-widget");
+  if (process.platform === "win32" && process.env.LOCALAPPDATA) return path.join(process.env.LOCALAPPDATA, "CodexTokenWidget");
+  return path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "codex-token-widget");
 }
 
 export function codexDataDirectory({ environment = process.env, home = os.homedir() } = {}) {
   const configured = String(environment.CODEX_HOME || "").trim();
   return configured ? path.resolve(configured) : path.join(home, ".codex");
 }
-
-const snapshotPath = path.join(applicationCacheDirectory(), "usage-summary.json");
-const legacySnapshotPath = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  ".cache",
-  "usage-summary.json",
-);
 
 function emptyUsage() {
   return {
@@ -100,6 +87,9 @@ function addUsage(target, source) {
 function eventUsage(row, previousBySession, sessionKey) {
   const info = row?.payload?.info;
   if (!info || typeof info !== "object") return null;
+  const cumulativeNow = normalizeUsage(info.total_token_usage);
+  const baseline = previousBySession.get(sessionKey);
+  if (cumulativeNow && baseline && cumulativeNow.totalTokens === baseline.totalTokens) return null;
   let usage = normalizeUsage(info.last_token_usage);
   if (!usage) {
     const cumulative = normalizeUsage(info.total_token_usage);
@@ -153,12 +143,12 @@ function mergePrompt(current, next) {
 }
 
 async function loadThreadMetadata() {
-  if (Date.now() - threadMetadataCache.loadedAt < 60_000) return threadMetadataCache;
+  if (threadMetadataCache.source === codexDataDirectory() && Date.now() - threadMetadataCache.loadedAt < 60_000) return threadMetadataCache;
   const titles = new Map();
   const roots = new Map();
   const codexRoot = codexDataDirectory();
+  let indexedNames = new Map();
   try {
-    let indexedNames = new Map();
     try {
       indexedNames = parseSessionNames(await readFile(path.join(codexRoot, "session_index.jsonl"), "utf8"));
     } catch {
@@ -167,7 +157,9 @@ async function loadThreadMetadata() {
     const { DatabaseSync } = await import("node:sqlite");
     const database = new DatabaseSync(path.join(codexRoot, "state_5.sqlite"), { readOnly: true });
     try {
-      const rows = database.prepare("SELECT id, rollout_path, name, title, source, thread_source FROM threads WHERE rollout_path IS NOT NULL").all();
+      const available = new Set(database.prepare("PRAGMA table_info(threads)").all().map((column) => column.name));
+      const fields = ["id", "rollout_path", "name", "title", "source", "thread_source"];
+      const rows = database.prepare("SELECT " + fields.map((field) => available.has(field) ? field : "NULL AS " + field).join(",") + " FROM threads WHERE rollout_path IS NOT NULL").all();
       const sessionById = new Map(rows.map((row) => [String(row.id || ""), path.basename(String(row.rollout_path || "")).toLowerCase()]));
       const parentBySession = new Map();
       for (const row of rows) {
@@ -199,7 +191,7 @@ async function loadThreadMetadata() {
   } catch {
     // Node 20 and non-Codex environments may not expose node:sqlite or the state database.
   }
-  threadMetadataCache = { loadedAt: Date.now(), titles, roots };
+  threadMetadataCache = { source: codexRoot, loadedAt: Date.now(), titles, roots, indexedNames };
   return threadMetadataCache;
 }
 
@@ -242,6 +234,11 @@ export function groupTasksByRoot(tasks, { titles = new Map(), roots = new Map() 
 
 async function attachTaskMetadata(tasks) {
   const metadata = await loadThreadMetadata();
+  for (const task of tasks.values()) {
+    const id = task.sessionKey.match(/([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i)?.[1];
+    const indexedTitle = metadata.indexedNames?.get(id);
+    if (indexedTitle) metadata.titles.set(task.sessionKey, indexedTitle);
+  }
   groupTasksByRoot(tasks, metadata);
 }
 
@@ -265,357 +262,117 @@ function shiftDay(dayKey, amount) {
   return localDayKey(date);
 }
 
-async function listJsonlFiles(root, output) {
-  const stack = [root];
-  while (stack.length) {
-    const directory = stack.pop();
-    let handle;
-    try {
-      handle = await opendir(directory);
-    } catch {
-      continue;
-    }
-    for await (const entry of handle) {
-      const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) stack.push(absolute);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) output.push(absolute);
-    }
+
+async function listJsonlFiles(root, output, optional = false) {
+  let handle;
+  try { handle = await opendir(root); }
+  catch (error) {
+    if (optional && error.code === "ENOENT") return false;
+    throw error;
   }
+  for await (const entry of handle) {
+    const absolute = path.join(root, entry.name);
+    if (entry.isDirectory()) await listJsonlFiles(absolute, output);
+    else if (entry.isFile() && /^rollout-.*\.jsonl$/i.test(entry.name)) output.push(absolute);
+  }
+  return true;
 }
 
-function rolloutStartDay(filePath) {
-  const match = path.basename(filePath).match(/rollout-(\d{4})-(\d{2})-(\d{2})/);
-  return match ? `${match[1]}-${match[2]}-${match[3]}` : "";
+function parserState() {
+  return { offset: 0, previous: new Map(), seen: new Set(), turns: new Map(), prompts: new Map(), active: "", serial: 0 };
 }
 
-function isCandidate(filePath, metadata, cutoffDay) {
-  const startDay = rolloutStartDay(filePath);
-  if (!startDay || startDay >= shiftDay(cutoffDay, -1)) return true;
-  return localDayKey(metadata.mtime) >= cutoffDay;
-}
-
-async function parseRollout(filePath) {
-  const deltas = [];
-  const turns = [];
-  const seenEvents = new Set();
-  const unidentifiedByDay = new Map();
-  const promptsByTurn = new Map();
-  let previousCumulative = null;
-  let activeTurn = null;
-  const input = createReadStream(filePath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input, crlfDelay: Infinity });
-
-  const finishActiveTurn = (timestamp) => {
-    if (!activeTurn || !activeTurn.usage.totalTokens) {
-      activeTurn = null;
-      return;
+function consumeLine(state, line, eof = false) {
+  if (eof) { try { JSON.parse(line); } catch { return false; } }
+  if (!/"(?:token_count|task_started|task_complete|response_item)"/.test(line)) return true;
+  if (/"type"\s*:\s*"response_item"/.test(line) && !/"role"\s*:\s*"user"/.test(line)) return true;
+  let row;
+  try { row = JSON.parse(line); } catch { return false; }
+  if (row?.type === "response_item") {
+    const prompt = userPrompt(row);
+    const id = messageTurnId(row) || state.active;
+    if (prompt && id) {
+      state.prompts.set(id, mergePrompt(state.prompts.get(id), prompt));
     }
-    turns.push({
-      day: localDayKey(timestamp || activeTurn.timestamp),
-      timestamp: String(timestamp || activeTurn.timestamp || ""),
-      identified: Boolean(activeTurn.turnId),
-      prompt: activeTurn.prompt || "",
-      usage: activeTurn.usage,
-    });
-    activeTurn = null;
-  };
+    return true;
+  }
+  if (row?.type !== "event_msg") return true;
+  const type = row.payload?.type;
+  if (type === "task_started") {
+    state.active = row.payload.turn_id || "unidentified-" + (++state.serial);
+    return true;
+  }
+  if (type === "task_complete") {
+    if (!row.payload.turn_id || row.payload.turn_id === state.active) state.active = "";
+    return true;
+  }
+  if (type !== "token_count") return true;
+  const day = localDayKey(row.timestamp);
+  if (!day) return true;
+  // A turn may contain many calls. Only identical event content is a duplicate;
+  // unchanged cumulative totals are handled by eventUsage.
+  const key = createHash("sha256").update(JSON.stringify([row.timestamp, row.payload.turn_id, row.payload.info])).digest("base64url").slice(0, 22);
+  if (state.seen.has(key)) return true;
+  const usage = eventUsage(row, state.previous, "session");
+  if (!usage) return true;
+  state.seen.add(key);
+  const turnId = row.payload.turn_id || state.active || "unidentified-day-" + day;
+  const identified = !turnId.startsWith("unidentified-");
+  // One row per turn/day: clipping a date range never imports another day's cost.
+  const turnKey = turnId + ":" + day;
+  const turn = state.turns.get(turnKey) || { turnId, day, timestamp: row.timestamp, identified, prompt: state.prompts.get(turnId) || "", usage: emptyUsage() };
+  turn.timestamp = row.timestamp;
+  addUsage(turn.usage, usage);
+  state.turns.set(turnKey, turn);
+  return true;
+}
 
+async function anchor(filePath, offset) {
+  const file = await open(filePath, "r");
   try {
-    for await (const line of lines) {
-      if (line.length > MAX_LINE_BYTES) continue;
-      const possibleEvent = line.includes('"event_msg"') && ["token_count", "task_started", "task_complete"].some((type) => line.includes(`"${type}"`));
-      const possibleUser = line.includes('"response_item"') && (line.includes('"role":"user"') || line.includes('"role": "user"'));
-      if (!possibleEvent && !possibleUser) continue;
-      let row;
-      try {
-        row = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (row?.type === "response_item") {
-        const prompt = userPrompt(row);
-        const turnId = messageTurnId(row);
-        if (prompt && turnId) promptsByTurn.set(turnId, mergePrompt(promptsByTurn.get(turnId), prompt));
-        if (prompt && activeTurn && (!turnId || turnId === activeTurn.turnId)) activeTurn.prompt = mergePrompt(activeTurn.prompt, prompt);
-        continue;
-      }
-      if (row?.type !== "event_msg") continue;
-      const payloadType = row?.payload?.type;
-      if (payloadType === "task_started") {
-        finishActiveTurn(row.timestamp);
-        activeTurn = {
-          turnId: typeof row.payload.turn_id === "string" ? row.payload.turn_id : "",
-          timestamp: String(row.timestamp || ""),
-          prompt: promptsByTurn.get(row.payload.turn_id) || "",
-          usage: emptyUsage(),
-        };
-        continue;
-      }
-      if (payloadType === "task_complete") {
-        finishActiveTurn(row.timestamp);
-        continue;
-      }
-      if (payloadType !== "token_count") continue;
-      const turnId = typeof row.payload.turn_id === "string" ? row.payload.turn_id : "";
-      const dedupKey = turnId || String(row.timestamp || "");
-      if (dedupKey && seenEvents.has(dedupKey)) continue;
-      const baselines = new Map([[filePath, previousCumulative]]);
-      const usage = eventUsage(row, baselines, filePath);
-      previousCumulative = baselines.get(filePath) || previousCumulative;
-      if (!usage) continue;
-      if (dedupKey) seenEvents.add(dedupKey);
-      const day = localDayKey(row.timestamp);
-      if (!day) continue;
-      const timestamp = String(row.timestamp || "");
-      deltas.push({ day, timestamp, usage });
-      if (activeTurn) {
-        addUsage(activeTurn.usage, usage);
-        activeTurn.timestamp = timestamp || activeTurn.timestamp;
-      } else if (turnId) {
-        turns.push({ day, timestamp, identified: true, prompt: promptsByTurn.get(turnId) || "", usage });
-      } else {
-        const unattributed = unidentifiedByDay.get(day) || {
-          day,
-          timestamp,
-          identified: false,
-          prompt: "",
-          usage: emptyUsage(),
-        };
-        unattributed.timestamp = timestamp || unattributed.timestamp;
-        addUsage(unattributed.usage, usage);
-        unidentifiedByDay.set(day, unattributed);
-      }
-    }
-    finishActiveTurn(activeTurn?.timestamp);
-  } finally {
-    lines.close();
-    input.destroy();
-  }
-  turns.push(...unidentifiedByDay.values());
-  return { deltas, turns };
+    const buffer = Buffer.alloc(Math.min(256, offset));
+    await file.read(buffer, 0, buffer.length, Math.max(0, offset - buffer.length));
+    return buffer.toString("base64");
+  } finally { await file.close(); }
 }
 
-async function scanWithRipgrep(sourceRoots) {
-  const buckets = new Map();
-  const tasks = new Map();
-  const seenEvents = new Set();
-  const seenTaskTurns = new Set();
-  const activeTurns = new Map();
-  const unidentifiedTurns = new Map();
-  const promptsByTurn = new Map();
-  const filesWithUsage = new Set();
-  const previousBySession = new Map();
-  let matchedLines = 0;
-  const args = [
-    "--no-heading",
-    "--with-filename",
-    "--null",
-    "--no-messages",
-    '(?:"type"\\s*:\\s*"(?:token_count|task_started|task_complete)"|"role"\\s*:\\s*"user")',
-    ...sourceRoots,
-  ];
-
-  await new Promise((resolve, reject) => {
-    const child = spawn("rg", args, { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
-    const decoder = new StringDecoder("utf8");
-    let pending = "";
-    let spawnError = null;
-
-    const appendTurn = (sessionKey, turn, turnId = "") => {
-      if (!turn?.usage?.totalTokens) return;
-      const uniqueTurn = turnId ? `${sessionKey}:${turnId}` : "";
-      if (uniqueTurn && seenTaskTurns.has(uniqueTurn)) return;
-      if (uniqueTurn) seenTaskTurns.add(uniqueTurn);
-      const task = tasks.get(sessionKey) || { sessionKey, turns: [] };
-      task.turns.push(turn);
-      tasks.set(sessionKey, task);
-    };
-
-    const finishActiveTurn = (sessionKey, timestamp) => {
-      const active = activeTurns.get(sessionKey);
-      if (!active) return;
-      appendTurn(sessionKey, {
-        day: localDayKey(timestamp || active.timestamp),
-        timestamp: String(timestamp || active.timestamp || ""),
-        identified: Boolean(active.turnId),
-        prompt: active.prompt || "",
-        usage: active.usage,
-      }, active.turnId);
-      activeTurns.delete(sessionKey);
-    };
-
-    const consume = (record) => {
-      const separator = record.indexOf("\0");
-      if (separator < 1) return;
-      const filePath = record.slice(0, separator);
-      const text = record.slice(separator + 1).trim();
-      if (!text || text.length > MAX_LINE_BYTES) return;
-      let row;
-      try {
-        row = JSON.parse(text);
-      } catch {
-        return;
-      }
-      const sessionKey = path.basename(filePath).toLowerCase();
-      if (row?.type === "response_item") {
-        const prompt = userPrompt(row);
-        const turnId = messageTurnId(row);
-        const promptKey = turnId ? `${sessionKey}:${turnId}` : "";
-        if (promptKey && prompt) promptsByTurn.set(promptKey, mergePrompt(promptsByTurn.get(promptKey), prompt));
-        const active = activeTurns.get(sessionKey);
-        if (prompt && active && (!turnId || turnId === active.turnId)) active.prompt = mergePrompt(active.prompt, prompt);
-        return;
-      }
-      if (row?.type !== "event_msg") return;
-      const payloadType = row?.payload?.type;
-      if (payloadType === "task_started") {
-        finishActiveTurn(sessionKey, row.timestamp);
-        const turnId = typeof row.payload.turn_id === "string" ? row.payload.turn_id : "";
-        activeTurns.set(sessionKey, {
-          turnId,
-          timestamp: String(row.timestamp || ""),
-          prompt: promptsByTurn.get(`${sessionKey}:${turnId}`) || "",
-          usage: emptyUsage(),
-        });
-        return;
-      }
-      if (payloadType === "task_complete") {
-        finishActiveTurn(sessionKey, row.timestamp);
-        return;
-      }
-      if (payloadType !== "token_count") return;
-      const turnId = typeof row.payload.turn_id === "string" ? row.payload.turn_id : "";
-      const eventKey = `${sessionKey}:${turnId || row.timestamp || matchedLines}`;
-      if (seenEvents.has(eventKey)) return;
-      const usage = eventUsage(row, previousBySession, sessionKey);
-      if (!usage) return;
-      const day = localDayKey(row.timestamp);
-      if (!day) return;
-      seenEvents.add(eventKey);
-      filesWithUsage.add(sessionKey);
-      matchedLines += 1;
-      const bucket = buckets.get(day) || { day, ...emptyUsage() };
-      addUsage(bucket, usage);
-      buckets.set(day, bucket);
-      const timestamp = String(row.timestamp || "");
-      const active = activeTurns.get(sessionKey);
-      if (active) {
-        addUsage(active.usage, usage);
-        active.timestamp = timestamp || active.timestamp;
-      } else if (turnId) {
-        appendTurn(sessionKey, { day, timestamp, identified: true, prompt: promptsByTurn.get(`${sessionKey}:${turnId}`) || "", usage }, turnId);
-      } else {
-        const key = `${sessionKey}:${day}`;
-        const unattributed = unidentifiedTurns.get(key) || {
-          sessionKey,
-          day,
-          timestamp,
-          identified: false,
-          prompt: "",
-          usage: emptyUsage(),
-        };
-        unattributed.timestamp = timestamp || unattributed.timestamp;
-        addUsage(unattributed.usage, usage);
-        unidentifiedTurns.set(key, unattributed);
-      }
-    };
-
-    child.once("error", (error) => {
-      spawnError = error;
-    });
-    child.stdout.on("data", (chunk) => {
-      pending += decoder.write(chunk);
-      let newline;
-      while ((newline = pending.indexOf("\n")) >= 0) {
-        consume(pending.slice(0, newline));
-        pending = pending.slice(newline + 1);
-      }
-    });
-    child.once("close", (code) => {
-      pending += decoder.end();
-      if (pending) consume(pending);
-      if (spawnError) return reject(spawnError);
-      if (code !== 0 && code !== 1) return reject(new Error(`rg exited with code ${code}`));
-      for (const sessionKey of activeTurns.keys()) finishActiveTurn(sessionKey);
-      for (const turn of unidentifiedTurns.values()) appendTurn(turn.sessionKey, turn);
-      resolve();
-    });
-  });
-
-  return {
-    generatedAtMs: Date.now(),
-    buckets,
-    tasks,
-    diagnostics: {
-      discoveredFiles: filesWithUsage.size,
-      uniqueFiles: filesWithUsage.size,
-      candidateFiles: filesWithUsage.size,
-      parsedFiles: filesWithUsage.size,
-      cacheHits: 0,
-      matchedEvents: matchedLines,
-      scanner: "ripgrep",
-    },
-  };
-}
-
-async function loadPersistedSnapshot() {
-  if (snapshotLoaded) return;
-  snapshotLoaded = true;
-  for (const candidate of [snapshotPath, legacySnapshotPath]) {
-    try {
-      const raw = JSON.parse(await readFile(candidate, "utf8"));
-      if (raw.version !== 7 || !Number.isFinite(raw.generatedAtMs) || !Array.isArray(raw.days) || !Array.isArray(raw.tasks)) continue;
-      ripgrepSnapshot = {
-        generatedAtMs: raw.generatedAtMs,
-        buckets: new Map(raw.days.map((day) => [day.day, day])),
-        tasks: new Map((raw.tasks || []).map((task) => [task.sessionKey, task])),
-        diagnostics: { ...raw.diagnostics, cacheSource: "disk" },
-      };
-      if (candidate === legacySnapshotPath) {
-        try {
-          await mkdir(path.dirname(snapshotPath), { recursive: true });
-          await writeFile(snapshotPath, JSON.stringify(raw), "utf8");
-        } catch { }
-      }
-      return;
-    } catch {
-      // Try the legacy location before falling back to a fresh scan.
+// Retain only bounded line buffers, including for giant tool-output records.
+// A partial last line is reread on the next refresh; a complete JSON EOF record
+// is supported for imported logs without a final newline.
+async function readIncrement(filePath, metadata, previous) {
+  let state = previous;
+  let reused = false;
+  if (state && state.ino === metadata.ino && state.birthtimeMs === metadata.birthtimeMs &&
+      metadata.size >= state.size && await anchor(filePath, state.offset) === state.anchor) {
+    reused = true;
+  } else state = parserState();
+  const initialOffset = state.offset;
+  const stream = metadata.size > state.offset ? createReadStream(filePath, { start: state.offset, end: metadata.size - 1, highWaterMark: 1024 * 1024 }) : null;
+  let parts = [], length = 0, skipping = false, position = state.offset;
+  if (stream) for await (const chunk of stream) {
+    let start = 0;
+    for (;;) {
+      const end = chunk.indexOf(10, start);
+      const stop = end < 0 ? chunk.length : end;
+      const part = chunk.subarray(start, stop);
+      position += part.length;
+      length += part.length;
+      if (length > MAX_LINE_BYTES) { skipping = true; parts = []; }
+      if (!skipping && part.length) parts.push(part);
+      if (end < 0) break;
+      if (!skipping) consumeLine(state, Buffer.concat(parts, length).toString("utf8"));
+      position++;
+      state.offset = position;
+      parts = []; length = 0; skipping = false;
+      start = end + 1;
     }
   }
-}
-
-async function refreshRipgrepSnapshot(sourceRoots) {
-  if (snapshotRefresh) return snapshotRefresh;
-  snapshotRefresh = (async () => {
-    const fresh = await scanWithRipgrep(sourceRoots);
-    await attachTaskMetadata(fresh.tasks);
-    ripgrepSnapshot = fresh;
-    try {
-      await mkdir(path.dirname(snapshotPath), { recursive: true });
-      await writeFile(snapshotPath, JSON.stringify({
-        version: 7,
-        generatedAtMs: fresh.generatedAtMs,
-        days: [...fresh.buckets.values()],
-        tasks: [...fresh.tasks.values()],
-        diagnostics: fresh.diagnostics,
-      }), "utf8");
-    } catch {
-      // The in-memory result remains usable if the optional cache cannot be saved.
-    }
-    return fresh;
-  })().finally(() => {
-    snapshotRefresh = null;
-  });
-  return snapshotRefresh;
-}
-
-async function readFileWithCache(filePath, metadata) {
-  const fingerprint = `${metadata.size}:${metadata.mtimeMs}`;
-  const cached = fileCache.get(filePath);
-  if (cached?.fingerprint === fingerprint) return { ...cached.result, hit: true };
-  const result = await parseRollout(filePath);
-  fileCache.set(filePath, { fingerprint, result });
-  return { ...result, hit: false };
+  if (!skipping && length && consumeLine(state, Buffer.concat(parts, length).toString("utf8"), true)) state.offset = position;
+  // A changed same-size file must always be reparsed, even if its final bytes match.
+  state.anchor = await anchor(filePath, state.offset);
+  state.size = metadata.size; state.mtimeMs = metadata.mtimeMs;
+  state.ino = metadata.ino; state.birthtimeMs = metadata.birthtimeMs;
+  return { state, bytesRead: metadata.size - initialOffset, reused };
 }
 
 function summarize(days) {
@@ -631,155 +388,161 @@ function anonymousTaskId(sessionKey) {
 function taskBreakdown(tasks, cutoffDay, today) {
   const result = [];
   for (const task of tasks.values()) {
-    const turns = task.turns
-      .filter((turn) => turn.day >= cutoffDay && turn.day <= today)
-      .sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+    const turns = task.turns.filter((turn) => turn.day >= cutoffDay && turn.day <= today)
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
     if (!turns.length) continue;
-    const usage = summarize(turns.map((turn) => turn.usage));
     const id = anonymousTaskId(task.sessionKey);
-    const fallbackTitle = turns.find((turn) => turn.prompt)?.prompt || "";
+    const publicTurns = turns.map((turn, index) => ({
+      number: index + 1, timestamp: turn.timestamp, day: turn.day, identified: turn.identified,
+      prompt: conciseText(turn.prompt), ...turn.usage,
+    }));
     result.push({
-      id,
-      label: `任务 ${id.slice(0, 4).toUpperCase()}`,
-      title: taskTitle(task.title) || taskTitle(fallbackTitle),
-      firstActivity: turns[0].timestamp,
-      lastActivity: turns.at(-1).timestamp,
-      ...usage,
-      turns: turns.map((turn, index) => ({
-        number: index + 1,
-        timestamp: turn.timestamp,
-        identified: turn.identified,
-        prompt: conciseText(turn.prompt, 240),
-        ...turn.usage,
-      })),
+      id, label: "任务 " + id.slice(0, 4).toUpperCase(),
+      title: taskTitle(task.title) || taskTitle(turns.find((turn) => turn.prompt)?.prompt || ""),
+      firstActivity: turns[0].timestamp, lastActivity: turns.at(-1).timestamp,
+      ...summarize(turns.map((turn) => turn.usage)), turnCount: turns.length,
+      revision: createHash("sha256").update(JSON.stringify(publicTurns)).digest("hex").slice(0, 16),
+      turns: publicTurns,
     });
   }
-  return result.sort((left, right) =>
-    right.totalTokens - left.totalTokens || right.lastActivity.localeCompare(left.lastActivity));
+  return result.sort((a, b) => b.totalTokens - a.totalTokens || b.lastActivity.localeCompare(a.lastActivity));
 }
 
-export async function collectUsage({ days = 30, roots, now = new Date() } = {}) {
-  const range = Math.max(7, Math.min(365, Number(days) || 30));
-  const today = localDayKey(now);
-  const cutoffDay = shiftDay(today, -(range - 1));
-  const codexRoot = codexDataDirectory();
-  const sourceRoots = roots || [
-    path.join(codexRoot, "sessions"),
-    path.join(codexRoot, "archived_sessions"),
-  ];
-
-  if (!roots) {
-    await loadPersistedSnapshot();
-    if (!ripgrepSnapshot) {
-      try {
-        await refreshRipgrepSnapshot(sourceRoots);
-      } catch {
-        ripgrepSnapshot = null;
+export function createUsageCollector({ cacheDirectory = applicationCacheDirectory(), clock = Date.now } = {}) {
+  const sources = new Map();
+  async function refresh(source, roots, useMetadata) {
+    if (source.refresh) return source.refresh;
+    source.refresh = (async () => {
+      const discovered = [];
+      let found = false;
+      for (const root of roots) found = await listJsonlFiles(root, discovered, true) || found;
+      if (!found) throw new Error("会话目录不存在或不可读取");
+      const unique = new Map();
+      // Limit outstanding filesystem work, rather than opening every log at once.
+      for (let i = 0; i < discovered.length; i += 32) {
+        await Promise.all(discovered.slice(i, i + 32).map(async (filePath) => {
+          const metadata = await stat(filePath);
+          const key = path.basename(filePath).toLowerCase();
+          const prior = unique.get(key);
+          if (!prior || metadata.mtimeMs > prior.metadata.mtimeMs ||
+              (metadata.mtimeMs === prior.metadata.mtimeMs && metadata.size > prior.metadata.size)) unique.set(key, { filePath, metadata });
+        }));
       }
-    } else if (Date.now() - ripgrepSnapshot.generatedAtMs > 4 * 60_000) {
-      // Return the last good summary immediately and refresh in the background.
-      refreshRipgrepSnapshot(sourceRoots).catch(() => {});
+      let parsedFiles = 0, cacheHits = 0, bytesRead = 0;
+      const tasks = new Map(), buckets = new Map(), livePaths = new Set();
+      for (const [sessionKey, { filePath, metadata }] of unique) {
+        livePaths.add(filePath);
+        let state = source.files.get(filePath);
+        if (state && state.size === metadata.size && state.mtimeMs === metadata.mtimeMs &&
+            state.ino === metadata.ino && state.birthtimeMs === metadata.birthtimeMs) cacheHits++;
+        else {
+          const prior = state && metadata.size > state.size ? state : null;
+          // Remove before mutating: a read failure must not leave a half-valid checkpoint.
+          source.files.delete(filePath);
+          const read = await readIncrement(filePath, metadata, prior);
+          state = read.state; bytesRead += read.bytesRead; parsedFiles++;
+          source.files.set(filePath, state);
+        }
+        const turns = [...state.turns.values()].map(({ turnId, ...turn }) => ({ ...turn, prompt: state.prompts.get(turnId) || turn.prompt, usage: { ...turn.usage } }));
+        tasks.set(sessionKey, { sessionKey, turns });
+        for (const turn of turns) {
+          const bucket = buckets.get(turn.day) || { day: turn.day, ...emptyUsage() };
+          addUsage(bucket, turn.usage); buckets.set(turn.day, bucket);
+        }
+      }
+      for (const filePath of source.files.keys()) if (!livePaths.has(filePath)) source.files.delete(filePath);
+      if (useMetadata) await attachTaskMetadata(tasks);
+      const snapshot = { generatedAtMs: clock(), tasks, buckets, diagnostics: {
+        discoveredFiles: discovered.length, uniqueFiles: unique.size, candidateFiles: unique.size,
+        parsedFiles, cacheHits, bytesRead, scanner: "node-incremental",
+      }};
+      source.snapshot = snapshot;
+      source.views.clear();
+      source.error = "";
+      if (source.persist) {
+        try {
+          await mkdir(cacheDirectory, { recursive: true });
+          const target = path.join(cacheDirectory, "usage-" + source.key + ".json.gz");
+          const temp = target + "." + randomUUID() + ".tmp";
+          try {
+          await writeFile(temp, await compress(JSON.stringify({ version: SNAPSHOT_VERSION, sourceKey: source.key,
+            generatedAtMs: snapshot.generatedAtMs, days: [...buckets.values()], tasks: [...tasks.values()], diagnostics: snapshot.diagnostics,
+            files: [...source.files].map(([filePath, state]) => [filePath, { ...state, previous: [...state.previous], seen: [...state.seen], turns: [...state.turns], prompts: [...state.prompts] }]) }), { level: 1 }), { mode: 0o600 });
+          await rename(temp, target);
+          } finally { await unlink(temp).catch(() => {}); }
+        } catch { snapshot.diagnostics.cacheWriteFailed = true; }
+      }
+    })().finally(() => { source.refresh = null; });
+    return source.refresh;
+  }
+  return async function collect({ days = 30, roots, now = new Date(), forceRefresh = false } = {}) {
+    const range = Math.max(7, Math.min(365, Math.floor(Number(days) || 30)));
+    const today = localDayKey(now);
+    const cutoff = shiftDay(today, -(range - 1));
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+    const sourceRoots = (roots || [path.join(codexDataDirectory(), "sessions"), path.join(codexDataDirectory(), "archived_sessions")]).map((root) => path.resolve(root));
+    const key = createHash("sha256").update(JSON.stringify([SNAPSHOT_VERSION, timezone, sourceRoots])).digest("hex").slice(0, 24);
+    let source = sources.get(key);
+    if (!source) {
+      source = { key, files: new Map(), views: new Map(), snapshot: null, refresh: null, persist: !roots, error: "" };
+      sources.set(key, source);
+      if (sources.size > 4) for (const [oldKey, oldSource] of sources) if (oldKey !== key && !oldSource.refresh) { sources.delete(oldKey); break; }
+      if (source.persist) try {
+        const raw = JSON.parse(await decompress(await readFile(path.join(cacheDirectory, "usage-" + key + ".json.gz")), { maxOutputLength: 512 * 1024 * 1024 }));
+        const validUsage = (u) => u && Object.keys(emptyUsage()).every((field) => Number.isFinite(u[field]) && u[field] >= 0);
+        if (raw.version === SNAPSHOT_VERSION && raw.sourceKey === key && Number.isFinite(raw.generatedAtMs) &&
+            raw.generatedAtMs <= clock() && Array.isArray(raw.days) && Array.isArray(raw.tasks) &&
+            raw.days.every((d) => /^\d{4}-\d{2}-\d{2}$/.test(d.day) && validUsage(d)) &&
+            raw.tasks.every((t) => typeof t.sessionKey === "string" && Array.isArray(t.turns) &&
+              t.turns.every((v) => validUsage(v.usage) && Number.isFinite(Date.parse(v.timestamp)) && typeof v.day === "string"))) {
+          source.snapshot = { generatedAtMs: raw.generatedAtMs, buckets: new Map(raw.days.map((d) => [d.day, d])),
+            tasks: new Map(raw.tasks.map((t) => [t.sessionKey, t])), diagnostics: { ...raw.diagnostics, cacheSource: "disk" } };
+          if (Array.isArray(raw.files)) for (const [filePath, state] of raw.files) {
+            if (typeof filePath !== "string" || !sourceRoots.some(root => {
+              const relative = path.relative(root, filePath);
+              return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+            })) continue;
+            if (!Number.isSafeInteger(state.offset) || state.offset < 0 || state.offset > state.size ||
+                !Number.isFinite(state.mtimeMs) || !Number.isFinite(state.birthtimeMs) || typeof state.anchor !== "string" ||
+                !Array.isArray(state.previous) || !Array.isArray(state.seen) || !Array.isArray(state.turns) || !Array.isArray(state.prompts) ||
+                !state.previous.every(pair => Array.isArray(pair) && validUsage(pair[1])) ||
+                !state.turns.every(pair => Array.isArray(pair) && validUsage(pair[1]?.usage) && typeof pair[1]?.turnId === "string") ||
+                !state.prompts.every(pair => Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string") ||
+                !state.seen.every(key => typeof key === "string")) continue;
+            source.files.set(filePath, { ...state, previous: new Map(state.previous), seen: new Set(state.seen), turns: new Map(state.turns), prompts: new Map(state.prompts) });
+          }
+        }
+      } catch { /* Invalid or old caches are rebuilt from source. */ }
     }
-    if (ripgrepSnapshot) {
-      await attachTaskMetadata(ripgrepSnapshot.tasks || new Map());
-      const timeline = [];
-      for (let index = 0; index < range; index += 1) {
-        const day = shiftDay(cutoffDay, index);
-        timeline.push(ripgrepSnapshot.buckets.get(day) || { day, ...emptyUsage() });
+    if (!source.snapshot || forceRefresh || roots || clock() - source.snapshot.generatedAtMs >= TTL) {
+      try { await refresh(source, sourceRoots, !roots); }
+      catch {
+        source.error = "本地日志刷新失败，当前显示上次成功统计";
+        if (!source.snapshot) throw new Error("无法读取本地会话目录，尚无可用统计缓存");
       }
-      const todayUsage = timeline.at(-1);
-      const yesterdayUsage = timeline.at(-2) || { day: shiftDay(today, -1), ...emptyUsage() };
-      return {
-        generatedAt: new Date().toISOString(),
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "local",
-        range,
-        today: todayUsage,
-        yesterday: yesterdayUsage,
-        last7: summarize(timeline.slice(-7)),
-        last30: summarize(timeline.slice(-30)),
-        total: summarize(timeline),
-        days: timeline,
-        tasks: taskBreakdown(ripgrepSnapshot.tasks || new Map(), cutoffDay, today),
-        diagnostics: { ...ripgrepSnapshot.diagnostics },
+    }
+    const snapshot = source.snapshot;
+    const viewKey = today + ":" + range;
+    let view = source.views.get(viewKey);
+    if (!view) {
+      const timeline = Array.from({ length: range }, (_, index) => {
+        const day = shiftDay(cutoff, index);
+        return snapshot.buckets.get(day) || { day, ...emptyUsage() };
+      });
+      const month = Array.from({ length: 30 }, (_, index) => snapshot.buckets.get(shiftDay(today, index - 29)) || emptyUsage());
+      view = {
+        generatedAt: new Date(snapshot.generatedAtMs).toISOString(), timezone, range,
+        today: timeline.at(-1), yesterday: timeline.at(-2), last7: summarize(month.slice(-7)),
+        last30: summarize(month), activeDays30: month.filter((d) => d.totalTokens > 0).length,
+        total: summarize(timeline), days: timeline, tasks: taskBreakdown(snapshot.tasks, cutoff, today),
+        diagnostics: { ...snapshot.diagnostics },
       };
+      if (source.views.size >= 8) source.views.delete(source.views.keys().next().value);
+      source.views.set(viewKey, view);
     }
-  }
-
-  const discovered = [];
-  for (const root of sourceRoots) await listJsonlFiles(root, discovered);
-
-  // The same rollout can briefly exist in active and archived storage. Prefer
-  // the newest copy, keyed by filename, so an archive operation never doubles usage.
-  const unique = new Map();
-  for (const filePath of discovered) {
-    let metadata;
-    try {
-      metadata = await stat(filePath);
-    } catch {
-      continue;
-    }
-    const key = path.basename(filePath).toLowerCase();
-    const existing = unique.get(key);
-    if (!existing || metadata.mtimeMs > existing.metadata.mtimeMs) {
-      unique.set(key, { filePath, metadata });
-    }
-  }
-
-  const buckets = new Map();
-  const tasks = new Map();
-  let parsedFiles = 0;
-  let cacheHits = 0;
-  let candidateFiles = 0;
-  for (const { filePath, metadata } of unique.values()) {
-    if (!isCandidate(filePath, metadata, cutoffDay)) continue;
-    candidateFiles += 1;
-    const result = await readFileWithCache(filePath, metadata);
-    if (result.hit) cacheHits += 1;
-    else parsedFiles += 1;
-    for (const delta of result.deltas) {
-      if (delta.day < cutoffDay || delta.day > today) continue;
-      const bucket = buckets.get(delta.day) || { day: delta.day, ...emptyUsage() };
-      addUsage(bucket, delta.usage);
-      buckets.set(delta.day, bucket);
-    }
-    const sessionKey = path.basename(filePath).toLowerCase();
-    const task = tasks.get(sessionKey) || { sessionKey, turns: [] };
-    task.turns.push(...result.turns);
-    tasks.set(sessionKey, task);
-  }
-
-  const timeline = [];
-  for (let index = 0; index < range; index += 1) {
-    const day = shiftDay(cutoffDay, index);
-    timeline.push(buckets.get(day) || { day, ...emptyUsage() });
-  }
-  const todayUsage = timeline.at(-1);
-  const yesterdayUsage = timeline.at(-2) || { day: shiftDay(today, -1), ...emptyUsage() };
-  const last7 = summarize(timeline.slice(-7));
-  const last30 = summarize(timeline.slice(-30));
-  const total = summarize(timeline);
-  if (!roots) await attachTaskMetadata(tasks);
-
-  return {
-    generatedAt: new Date().toISOString(),
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "local",
-    range,
-    today: todayUsage,
-    yesterday: yesterdayUsage,
-    last7,
-    last30,
-    total,
-    days: timeline,
-    tasks: taskBreakdown(tasks, cutoffDay, today),
-    diagnostics: {
-      discoveredFiles: discovered.length,
-      uniqueFiles: unique.size,
-      candidateFiles,
-      parsedFiles,
-      cacheHits,
-      scanner: "node",
-    },
+    return { ...view, stale: Boolean(source.error) || clock() - snapshot.generatedAtMs >= TTL, refreshError: source.error };
   };
 }
 
+export const collectUsage = createUsageCollector();
 export { emptyUsage, normalizeUsage };

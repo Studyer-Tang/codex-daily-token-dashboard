@@ -1,4 +1,4 @@
-const state = { days: 30, data: null, timer: null, taskLimit: 20 };
+const state = { days: 30, data: null, timer: null, taskLimit: 20, epoch: 0, controller: null };
 const formatter = new Intl.NumberFormat("zh-CN");
 const compactFormatter = new Intl.NumberFormat("zh-CN", {
   notation: "compact",
@@ -82,7 +82,8 @@ function renderHeatmap(days) {
 function renderRecent(days) {
   const recent = days.slice(-7).reverse();
   const max = Math.max(...recent.map((day) => day.totalTokens), 1);
-  $("#recent-list").innerHTML = recent.map((day) => `<div class="recent-row"><time>${day.day.slice(5).replace("-", "/")}</time><span class="recent-bar"><i style="width:${(day.totalTokens / max) * 100}%"></i></span><strong>${compact(day.totalTokens)}</strong></div>`).join("");
+  $("#recent-list").innerHTML = recent.map((day) => `<div class="recent-row"><time>${day.day.slice(5).replace("-", "/")}</time><span class="recent-bar"><i></i></span><strong>${compact(day.totalTokens)}</strong></div>`).join("");
+  document.querySelectorAll(".recent-bar i").forEach((bar, index) => { bar.style.width = (recent[index].totalTokens / max) * 100 + "%"; });
 }
 
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
@@ -105,80 +106,108 @@ function activityTime(value) {
   }).format(date);
 }
 
-function renderTurnList(container, task, highThreshold, limit = 50) {
-  const visibleTurns = task.turns.slice(0, limit);
-  container.innerHTML = visibleTurns.map((turn) => {
-    const high = turn.totalTokens >= highThreshold;
-    return `<div class="turn-row">
-      <div class="turn-identity">
-        <strong>${turn.identified ? `第 ${turn.number} 轮` : "未标记轮次"}</strong>
-        <time>${escapeHtml(activityTime(turn.timestamp))}</time>
-      </div>
-      <div class="turn-parts">
-        <span>输入 ${compact(turn.inputTokens)}</span>
-        <span>缓存 ${compact(turn.cachedInputTokens)}</span>
-        <span>输出 ${compact(turn.outputTokens)}</span>
-      </div>
-      ${high ? '<span class="high-usage">高消耗</span>' : ""}
-      <strong class="turn-total">${compact(turn.totalTokens)}</strong>
-    </div>`;
-  }).join("") + (visibleTurns.length < task.turns.length
-    ? `<button class="load-more-turns">继续显示 · 还有 ${task.turns.length - visibleTurns.length} 轮</button>`
-    : "");
-  container.querySelector(".load-more-turns")?.addEventListener("click", () => {
-    renderTurnList(container, task, highThreshold, limit + 50);
+async function api(parameters, signal) {
+  const response = await fetch("/api/usage?" + new URLSearchParams(parameters), {
+    cache: "no-store", signal: signal || AbortSignal.timeout(190000),
+    headers: { "X-Codex-Token": document.querySelector('meta[name="dashboard-token"]').content },
   });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+  return payload;
+}
+
+async function loadTurns(container, task, offset = 0) {
+  const epoch = state.epoch;
+  const button = container.querySelector("button");
+  if (button) button.disabled = true;
+  if (!offset) container.textContent = "正在读取轮次…";
+  try {
+    const data = await api({ days: state.days, task: task.id, revision: task.revision, turnOffset: offset, turnLimit: 50 });
+    if (epoch !== state.epoch || !container.isConnected) return;
+    if (data.revisionMismatch) {
+      container.textContent = "数据已更新，请刷新任务列表后重新展开。";
+      return;
+    }
+    const detail = data.tasks[0];
+    if (!detail) throw new Error("任务已不存在");
+    if (!offset) container.replaceChildren();
+    else button?.remove();
+    for (const turn of detail.turns) {
+      const row = document.createElement("div");
+      row.className = "turn-row";
+      row.innerHTML = `<div class="turn-identity"><strong>${turn.identified ? "第 " + turn.number + " 段" : "未标记轮次"}</strong><time>${escapeHtml(activityTime(turn.timestamp))}</time></div>
+        <div class="turn-parts"><span>输入 ${compact(turn.inputTokens)}</span><span>缓存 ${compact(turn.cachedInputTokens)}</span><span>输出 ${compact(turn.outputTokens)}</span></div>
+        ${turn.totalTokens >= 100000 ? '<span class="high-usage">高消耗</span>' : ""}
+        <strong class="turn-total">${compact(turn.totalTokens)}</strong>`;
+      row.title = turn.prompt || "";
+      container.append(row);
+    }
+    const next = offset + detail.turns.length;
+    if (next < detail.turnCount) {
+      const more = document.createElement("button");
+      more.className = "load-more-turns";
+      more.textContent = "继续显示 · 还有 " + (detail.turnCount - next) + " 段";
+      more.onclick = () => loadTurns(container, task, next);
+      container.append(more);
+    }
+    container.dataset.loaded = "true";
+  } catch (error) {
+    if (epoch !== state.epoch || !container.isConnected) return;
+    const retry = button || document.createElement("button");
+    retry.textContent = "读取失败，点击重试";
+    retry.title = error.message;
+    retry.disabled = false;
+    retry.onclick = () => loadTurns(container, task, offset);
+    if (!button) container.replaceChildren(retry);
+  }
 }
 
 function renderTasks(tasks = []) {
   const list = $("#task-list");
-  const totalTurns = tasks.reduce((sum, task) => sum + task.turns.length, 0);
-  $("#task-summary").textContent = `${tasks.length} 个任务 · ${totalTurns} 轮`;
+  $("#task-summary").textContent = `${state.data.taskTotal} 个任务 · ${state.data.turnTotal} 个日内轮次段`;
   if (!tasks.length) {
     list.innerHTML = '<div class="task-empty">当前范围内没有可显示的任务记录</div>';
     return;
   }
-
-  const maximum = Math.max(...tasks.map((task) => task.totalTokens), 1);
-  const turnValues = tasks.flatMap((task) => task.turns.map((turn) => turn.totalTokens)).sort((a, b) => a - b);
-  const median = turnValues[Math.floor(turnValues.length / 2)] || 0;
-  const highThreshold = Math.max(100_000, median * 2);
-  const visibleTasks = tasks.slice(0, state.taskLimit);
-
-  list.innerHTML = visibleTasks.map((task, taskIndex) => {
-    return `<details class="task-item" data-task-index="${taskIndex}">
-      <summary>
-        <span class="task-rank">${String(taskIndex + 1).padStart(2, "0")}</span>
-        <div class="task-identity">
-          <strong>${escapeHtml(task.label)}</strong>
-          <span>${task.turns.length} 轮 · 最近 ${escapeHtml(activityTime(task.lastActivity))}</span>
-          <i><b style="width:${Math.max(2, (task.totalTokens / maximum) * 100)}%"></b></i>
-        </div>
-        <div class="task-token">
-          <strong>${compact(task.totalTokens)}</strong>
-          <span>输入 ${compact(task.inputTokens)} · 输出 ${compact(task.outputTokens)}</span>
-        </div>
-        <span class="task-chevron">⌄</span>
-      </summary>
-      <div class="turn-list"></div>
-    </details>`;
-  }).join("") + (visibleTasks.length < tasks.length
-    ? `<button id="load-more-tasks" class="load-more-tasks">继续显示 · 还有 ${tasks.length - visibleTasks.length} 个任务</button>`
-    : "");
-
-  list.querySelectorAll(".task-item").forEach((details) => {
+  const maximum = Math.max(...tasks.map(task => task.totalTokens), 1);
+  list.innerHTML = tasks.map((task, index) => `<details class="task-item">
+    <summary><span class="task-rank">${index + 1}</span>
+      <div class="task-identity"><strong>${escapeHtml(task.title || task.label)}</strong>
+        <span>${task.turnCount} 段 · 最近 ${escapeHtml(activityTime(task.lastActivity))}</span><i><b></b></i></div>
+      <div class="task-token"><strong>${compact(task.totalTokens)}</strong><span>输入 ${compact(task.inputTokens)} · 输出 ${compact(task.outputTokens)}</span></div>
+      <span class="task-chevron">⌄</span></summary><div class="turn-list"></div></details>`).join("");
+  list.querySelectorAll(".task-item").forEach((details, index) => {
+    details.querySelector("b").style.width = Math.max(2, tasks[index].totalTokens / maximum * 100) + "%";
     details.addEventListener("toggle", () => {
       const container = details.querySelector(".turn-list");
-      if (!details.open || container.dataset.loaded) return;
-      const task = tasks[Number(details.dataset.taskIndex)];
-      renderTurnList(container, task, highThreshold);
-      container.dataset.loaded = "true";
+      if (details.open && !container.dataset.started) {
+        container.dataset.started = "true";
+        loadTurns(container, tasks[index]);
+      }
     });
   });
-  $("#load-more-tasks")?.addEventListener("click", () => {
-    state.taskLimit += 20;
-    renderTasks(tasks);
-  });
+  if (tasks.length < state.data.taskTotal) {
+    const more = document.createElement("button");
+    more.className = "load-more-tasks";
+    more.textContent = "继续显示 · 还有 " + (state.data.taskTotal - tasks.length) + " 个任务";
+    more.onclick = async () => {
+      const epoch = state.epoch;
+      more.disabled = true;
+      try {
+        const next = await api({ days: state.days, taskDetail: "summary", taskOffset: tasks.length, taskLimit: 20 });
+        if (epoch !== state.epoch || !more.isConnected) return;
+        if (next.generatedAt !== state.data.generatedAt) { await load(); return; }
+        state.data.tasks.push(...next.tasks);
+        renderTasks(state.data.tasks);
+      } catch (error) {
+        if (epoch !== state.epoch) return;
+        more.textContent = "加载失败，点击重试";
+        more.title = error.message;
+        more.disabled = false;
+      }
+    };
+    list.append(more);
+  }
 }
 
 function render(data) {
@@ -189,7 +218,7 @@ function render(data) {
   $("#week-value").textContent = compact(last7.totalTokens);
   $("#week-average").textContent = `日均 ${compact(last7.totalTokens / 7)} Token`;
   $("#month-value").textContent = compact(last30.totalTokens);
-  $("#active-days").textContent = `活跃 ${days.slice(-30).filter((day) => day.totalTokens > 0).length} 天`;
+  $("#active-days").textContent = `活跃 ${data.activeDays30} 天`;
 
   const change = $("#today-change");
   if (!yesterday.totalTokens) {
@@ -207,27 +236,33 @@ function render(data) {
   renderHeatmap(days);
   renderRecent(days);
   renderTasks(tasks);
-  const time = new Date(data.generatedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  $("#status").className = "";
-  $("#status").innerHTML = `<i></i>已同步 · ${time}`;
+  const time = new Date(data.generatedAt).toLocaleString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  $("#status").className = data.stale ? "error" : "";
+  $("#status").replaceChildren(document.createElement("i"), document.createTextNode(`${data.stale ? "旧缓存，刷新失败" : "已同步"} · ${time}`));
   $("#diagnostics").textContent = `${data.diagnostics.candidateFiles} 个会话文件 · ${data.timezone}`;
 }
 
-async function load() {
+async function load(forceRefresh = false) {
+  const epoch = ++state.epoch;
+  state.controller?.abort();
+  const controller = new AbortController();
+  state.controller = controller;
+  const timeout = setTimeout(() => controller.abort(), 190000);
   const refresh = $("#refresh");
   refresh.classList.add("loading");
   $("#status").innerHTML = "<i></i>正在读取本地日志…";
   try {
-    const response = await fetch(`/api/usage?days=${state.days}`, { cache: "no-store" });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+    const payload = await api({ days: state.days, taskDetail: "summary", taskLimit: 20, forceRefresh: forceRefresh ? "1" : "0" }, controller.signal);
+    if (epoch !== state.epoch) return;
     render(payload);
   } catch (error) {
+    if (epoch !== state.epoch) return;
     const status = $("#status");
     status.className = "error";
-    status.replaceChildren(document.createElement("i"), document.createTextNode(`读取失败：${error.message}`));
+    status.replaceChildren(document.createElement("i"), document.createTextNode(`读取失败，保留上次结果：${error.name === "AbortError" ? "请求超时" : error.message}`));
   } finally {
-    refresh.classList.remove("loading");
+    clearTimeout(timeout);
+    if (epoch === state.epoch) refresh.classList.remove("loading");
   }
 }
 
@@ -240,6 +275,6 @@ document.querySelectorAll("[data-days]").forEach((button) => {
     load();
   });
 });
-$("#refresh").addEventListener("click", load);
+$("#refresh").addEventListener("click", () => load(true));
 load();
 state.timer = window.setInterval(load, 5 * 60_000);

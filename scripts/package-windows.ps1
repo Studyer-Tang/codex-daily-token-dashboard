@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$stagingRoot = Join-Path $projectRoot ".release-staging"
+$stagingRoot = Join-Path $projectRoot (".release-staging-" + [Guid]::NewGuid().ToString("N"))
 $packageRoot = Join-Path $stagingRoot "CodexTokenWidget"
 $outputRoot = Join-Path $projectRoot $OutputDirectory
 
@@ -16,7 +16,7 @@ try {
 
     if (Test-Path -LiteralPath $stagingRoot) {
         $resolvedStaging = (Resolve-Path -LiteralPath $stagingRoot).Path
-        if (-not $resolvedStaging.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $resolvedStaging.StartsWith(($projectRoot + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "Unsafe staging path: $resolvedStaging"
         }
         Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
@@ -25,18 +25,26 @@ try {
     New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
     Copy-Item -LiteralPath "CodexTokenWidget.exe", "server.mjs", "START-HERE.txt", "README.md", "CHANGELOG.md", "LICENSE", "start-dashboard.cmd", "stop-dashboard.cmd" -Destination $packageRoot
-    Copy-Item -LiteralPath "src", "public", "widget" -Destination $packageRoot -Recurse
+    Copy-Item -LiteralPath "src", "public" -Destination $packageRoot -Recurse
+    $packagedScripts = Join-Path $packageRoot "scripts"
+    New-Item -ItemType Directory -Path $packagedScripts -Force | Out-Null
+    Copy-Item -LiteralPath "scripts/start-dashboard.ps1", "scripts/stop-dashboard.mjs" -Destination $packagedScripts
 
     if ($IncludeBundledNode) {
         $nodeCommand = Get-Command node.exe -ErrorAction Stop
+        $runtimeInfo = & $nodeCommand.Source -p "JSON.stringify({version:process.versions.node,arch:process.arch,platform:process.platform})" | ConvertFrom-Json
+        if ([version]$runtimeInfo.version -lt [version]"22.13.0" -or $runtimeInfo.arch -ne "x64" -or $runtimeInfo.platform -ne "win32") {
+            throw "Packaging requires Windows x64 Node.js 22.13 or newer."
+        }
         $runtime = Join-Path $packageRoot "runtime"
         New-Item -ItemType Directory -Path $runtime -Force | Out-Null
         Copy-Item -LiteralPath $nodeCommand.Source -Destination (Join-Path $runtime "node.exe")
     }
 
     $zipPath = Join-Path $outputRoot "CodexTokenWidget-windows-x64.zip"
-    if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-    Compress-Archive -Path $packageRoot -DestinationPath $zipPath -CompressionLevel Optimal
+    $temporaryZip = Join-Path $stagingRoot "package.zip"
+    Compress-Archive -Path $packageRoot -DestinationPath $temporaryZip -CompressionLevel Optimal
+    Move-Item -LiteralPath $temporaryZip -Destination $zipPath -Force
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     $stream = [System.IO.File]::OpenRead($zipPath)
     try {
@@ -56,7 +64,7 @@ finally {
     Pop-Location
     if (Test-Path -LiteralPath $stagingRoot) {
         $resolvedStaging = (Resolve-Path -LiteralPath $stagingRoot).Path
-        if ($resolvedStaging.StartsWith($projectRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($resolvedStaging.StartsWith(($projectRoot + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase)) {
             Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
         }
     }

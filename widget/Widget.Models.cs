@@ -5,6 +5,9 @@ internal sealed partial class TokenWidgetForm
     private sealed class UsageTask
     {
         public string Id = "";
+        public string Revision = "";
+        public bool FollowLatest;
+        public string FocusTimestamp = "";
         public string Label = "匿名任务";
         public string Title = "";
         public string LastActivity = "";
@@ -17,6 +20,16 @@ internal sealed partial class TokenWidgetForm
         public bool DetailsLoading;
         public string DetailError = "";
         public List<UsageTurn> Turns = new List<UsageTurn>();
+
+        public bool UpdateRevision(string next)
+        {
+            if (Revision == next) return false;
+            Revision = next;
+            DetailsLoaded = false;
+            DetailError = "";
+            Turns.Clear();
+            return true;
+        }
     }
 
     private sealed class UsageTurn

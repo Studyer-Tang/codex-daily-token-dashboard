@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark" />
     <title>Codex Token 日历</title>
     <link rel="icon" href="/icon.svg" />
-    <link rel="stylesheet" href="/styles.css?v=1.5.2" />
+    <link rel="stylesheet" href="/styles.css?v=1.6.0" />
   </head>
   <body>
     <div class="ambient ambient-one"></div>
@@ -97,7 +97,7 @@
           </div>
           <span id="task-summary" class="task-summary">正在统计</span>
         </div>
-        <p class="tasks-note">仅显示匿名任务编号和 Token 数据，不读取对话正文。点击任务可查看每轮明细。</p>
+        <p class="tasks-note">在本机读取任务标题及用户提示词摘要，不上传数据。跨日轮次按日拆段；高消耗标记为单段 ≥ 10 万 Token。点击任务查看明细，悬停查看摘要。</p>
         <div id="task-list" class="task-list" aria-live="polite"></div>
       </section>
 
@@ -130,6 +130,6 @@
         <span id="diagnostics"></span>
       </footer>
     </main>
-    <script type="module" src="/app.js?v=1.5.2"></script>
+    <script type="module" src="/app.js?v=1.6.0"></script>
   </body>
 </html>

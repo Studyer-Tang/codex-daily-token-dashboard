@@ -38,6 +38,7 @@ internal sealed partial class TokenWidgetForm : Form
 {
     private const int DefaultPort = 4817;
     private int servicePort = DefaultPort;
+    private readonly string serviceToken = Guid.NewGuid().ToString("N") + Guid.NewGuid().ToString("N");
     private readonly Color bg = Color.FromArgb(20, 22, 24);
     private readonly Color surface = Color.FromArgb(27, 30, 33);
     private readonly Color surfaceHigh = Color.FromArgb(35, 38, 42);
@@ -131,7 +132,7 @@ internal sealed partial class TokenWidgetForm : Form
         menu.Items.Add(new ToolStripSeparator());
         var exitItem = menu.Items.Add("退出");
         showItem.Click += delegate { ShowWidget(); };
-        refreshItem.Click += delegate { RequestUsage(); ShowWidget(); };
+        refreshItem.Click += delegate { RequestUsage(true); ShowWidget(); };
         logItem.Click += delegate { OpenLog(); };
         compactMenuItem.Click += delegate { ToggleCompact(); };
         totalModeMenuItem.Click += delegate { SetCompactDisplay(false); };
@@ -509,7 +510,7 @@ internal sealed partial class TokenWidgetForm : Form
         if (new Rectangle(285, 17, 49, 28).Contains(e.Location)) { TopMost = !TopMost; Invalidate(); return; }
         if (new Rectangle(165, 18, 38, 26).Contains(e.Location)) { taskView = false; selectedTaskIndex = -1; Invalidate(); return; }
         if (new Rectangle(207, 18, 38, 26).Contains(e.Location)) { taskView = true; selectedTaskIndex = -1; Invalidate(); return; }
-        if (new Rectangle(310, 521, 54, 25).Contains(e.Location)) { RequestUsage(); return; }
+        if (new Rectangle(310, 521, 54, 25).Contains(e.Location)) { RequestUsage(true); return; }
         if (taskView)
         {
             if (selectedTaskIndex >= 0)
@@ -652,6 +653,7 @@ internal sealed partial class TokenWidgetForm : Form
             };
             startInfo.EnvironmentVariables["CODEX_TOKEN_PARENT_PID"] = Process.GetCurrentProcess().Id.ToString();
             startInfo.EnvironmentVariables["CODEX_TOKEN_PORT"] = servicePort.ToString();
+            startInfo.EnvironmentVariables["CODEX_TOKEN_AUTH_TOKEN"] = serviceToken;
             var serverProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             ownedServer = serverProcess;
             serverProcess.OutputDataReceived += delegate(object sender, DataReceivedEventArgs args)
@@ -765,7 +767,7 @@ internal sealed partial class TokenWidgetForm : Form
     {
         for (var candidate = DefaultPort; candidate <= DefaultPort + 10; candidate++)
         {
-            if (ServiceHealthy(candidate) || PortAvailable(candidate))
+            if (PortAvailable(candidate))
             {
                 servicePort = candidate;
                 return;
@@ -789,25 +791,33 @@ internal sealed partial class TokenWidgetForm : Form
 
     private bool ServiceHealthy() { return ServiceHealthy(servicePort); }
 
-    private static bool ServiceHealthy(int port)
+    private bool ServiceHealthy(int port)
     {
         try
         {
-            var request = WebRequest.Create("http://127.0.0.1:" + port + "/api/health");
+            var request = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/api/health");
+            request.Proxy = null;
+            request.ReadWriteTimeout = 1500;
+            request.Headers["X-Codex-Token"] = serviceToken;
             request.Timeout = 1500;
             using (var response = request.GetResponse())
             using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
-                return reader.ReadToEnd().Contains("codex-daily-token-dashboard");
+                {
+                var payload = DeserializePayload(reader.ReadToEnd());
+                return TextValue(payload, "service") == "codex-daily-token-dashboard" && BooleanValue(payload, "authorized");
+            }
         }
         catch { return false; }
     }
 
-    private void RequestUsage()
+    private void RequestUsage(bool forceRefresh = false)
     {
         if (requestBusy) return;
         requestBusy = true;
+        var requestedQuery = TaskSearchQuery;
         SetStatus("正在读取本地记录", amber);
-        var client = new WebClient { Encoding = System.Text.Encoding.UTF8 };
+        var client = new WebClient { Encoding = System.Text.Encoding.UTF8, Proxy = null };
+        client.Headers["X-Codex-Token"] = serviceToken;
         var timedOut = 0;
         var timeoutTimer = new System.Threading.Timer(
             delegate(object state)
@@ -816,7 +826,7 @@ internal sealed partial class TokenWidgetForm : Form
                 try { client.CancelAsync(); } catch { }
             },
             null,
-            50000,
+            190000,
             Timeout.Infinite
         );
         client.DownloadStringCompleted += delegate(object sender, DownloadStringCompletedEventArgs args)
@@ -825,13 +835,14 @@ internal sealed partial class TokenWidgetForm : Form
             try
             {
                 if (args.Cancelled && Interlocked.CompareExchange(ref timedOut, 0, 0) == 1)
-                    throw new TimeoutException("读取用量请求超过 50 秒");
+                    throw new TimeoutException("读取用量请求超过 190 秒");
                 if (args.Cancelled) throw new WebException("用量请求已取消");
                 if (args.Error != null) throw args.Error;
-                RenderUsage(DeserializePayload(args.Result));
+                if (requestedQuery == TaskSearchQuery) RenderUsage(DeserializePayload(args.Result));
             }
             catch (Exception error) { failure = error; }
             finally { requestBusy = false; timeoutTimer.Dispose(); client.Dispose(); }
+            if (failure == null) RefreshVisibleDetails();
             if (failure != null)
             {
                 var detail = DescribeError(failure);
@@ -841,7 +852,7 @@ internal sealed partial class TokenWidgetForm : Form
                 BeginRecovery(detail);
             }
         };
-        var url = "http://127.0.0.1:" + servicePort + "/api/usage?days=30&taskDetail=summary" + TaskSearchParameter();
+        var url = "http://127.0.0.1:" + servicePort + "/api/usage?days=30&taskDetail=summary" + TaskSearchParameter() + (forceRefresh ? "&forceRefresh=1" : "");
         client.DownloadStringAsync(new Uri(url));
     }
 
@@ -849,11 +860,13 @@ internal sealed partial class TokenWidgetForm : Form
     {
         if (task == null || taskRequestBusy || task.DetailsLoading) return;
         if (task.DetailsLoaded && String.IsNullOrWhiteSpace(task.DetailError)) return;
+        var expectedRevision = task.Revision;
         taskRequestBusy = true;
         task.DetailsLoading = true;
         task.DetailError = "";
         Invalidate();
-        var client = new WebClient { Encoding = Encoding.UTF8 };
+        var client = new WebClient { Encoding = Encoding.UTF8, Proxy = null };
+        client.Headers["X-Codex-Token"] = serviceToken;
         var timedOut = 0;
         var timeoutTimer = new System.Threading.Timer(
             delegate(object state)
@@ -862,7 +875,7 @@ internal sealed partial class TokenWidgetForm : Form
                 try { client.CancelAsync(); } catch { }
             },
             null,
-            50000,
+            190000,
             Timeout.Infinite
         );
         client.DownloadStringCompleted += delegate(object sender, DownloadStringCompletedEventArgs args)
@@ -871,17 +884,29 @@ internal sealed partial class TokenWidgetForm : Form
             try
             {
                 if (args.Cancelled && Interlocked.CompareExchange(ref timedOut, 0, 0) == 1)
-                    throw new TimeoutException("读取任务轮次超过 50 秒");
+                    throw new TimeoutException("读取任务轮次超过 190 秒");
                 if (args.Cancelled) throw new WebException("任务轮次请求已取消");
                 if (args.Error != null) throw args.Error;
+                if (task.Revision != expectedRevision) return;
                 var data = DeserializePayload(args.Result);
+                if (BooleanValue(data, "revisionMismatch")) { task.DetailError = "数据已更新，正在刷新"; BeginInvoke(new Action(delegate { RequestUsage(); })); return; }
                 var items = data != null && data.ContainsKey("tasks") ? data["tasks"] as object[] : null;
                 if (items == null || items.Length == 0) throw new InvalidDataException("未找到任务轮次");
                 var detail = ParseUsageTask(Dict(items[0]), false);
+                if (detail.Revision != expectedRevision) return;
                 task.Turns = detail.Turns;
                 task.TurnCount = detail.TurnCount;
                 if (!String.IsNullOrWhiteSpace(detail.Title)) task.Title = detail.Title;
                 task.DetailsLoaded = true;
+                if (focusedTaskId == task.Id)
+                {
+                    if (task.FollowLatest) focusedTurnIndex = task.Turns.Count - 1;
+                    else
+                    {
+                        var saved = task.Turns.FindIndex(turn => turn.Timestamp == task.FocusTimestamp);
+                        if (saved >= 0) focusedTurnIndex = saved;
+                    }
+                }
                 if (pendingFocusTaskId == task.Id)
                 {
                     pendingFocusTaskId = "";
@@ -896,6 +921,7 @@ internal sealed partial class TokenWidgetForm : Form
                 taskRequestBusy = false;
                 timeoutTimer.Dispose();
                 client.Dispose();
+                if (failure == null && !IsDisposed) BeginInvoke(new Action(RefreshVisibleDetails));
             }
             if (failure != null)
             {
@@ -904,8 +930,22 @@ internal sealed partial class TokenWidgetForm : Form
             }
             Invalidate();
         };
-        var url = "http://127.0.0.1:" + servicePort + "/api/usage?days=30&task=" + Uri.EscapeDataString(task.Id);
+        var url = "http://127.0.0.1:" + servicePort + "/api/usage?days=30&task=" + Uri.EscapeDataString(task.Id) + "&revision=" + Uri.EscapeDataString(expectedRevision);
         client.DownloadStringAsync(new Uri(url));
+    }
+
+    private void RefreshVisibleDetails()
+    {
+        if (allowExit || IsDisposed || taskRequestBusy) return;
+        var selected = selectedTaskIndex >= 0 && selectedTaskIndex < usageTasks.Count ? usageTasks[selectedTaskIndex] : null;
+        if (selected != null && !selected.DetailsLoaded && String.IsNullOrWhiteSpace(selected.DetailError))
+            RequestTaskDetails(selected);
+        else
+        {
+            var focused = FocusedTask();
+            if (focused != null && !focused.DetailsLoaded && String.IsNullOrWhiteSpace(focused.DetailError))
+                RequestTaskDetails(focused);
+        }
     }
 
     private static Dictionary<string, object> DeserializePayload(string json)
@@ -1047,6 +1087,16 @@ internal sealed partial class TokenWidgetForm : Form
                 UsageTask existing;
                 if (previous.TryGetValue(parsed.Id, out existing))
                 {
+                    if (existing.Revision != parsed.Revision)
+                    {
+                        var oldTurn = focusedTaskId == existing.Id ? FocusedTurn(existing) : null;
+                        if (oldTurn != null)
+                        {
+                            existing.FollowLatest = focusedTurnIndex == existing.Turns.Count - 1;
+                            existing.FocusTimestamp = oldTurn.Timestamp;
+                        }
+                        existing.UpdateRevision(parsed.Revision);
+                    }
                     existing.Label = parsed.Label;
                     existing.Title = parsed.Title;
                     existing.LastActivity = parsed.LastActivity;
@@ -1067,7 +1117,7 @@ internal sealed partial class TokenWidgetForm : Form
         taskScroll = Math.Max(0, Math.Min(taskScroll, Math.Max(0, usageTasks.Count - 7)));
         SetCompactDisplay(compactTaskMode);
         dataReady = true;
-        SetStatus("已同步 · " + DateTime.Now.ToString("HH:mm"), cyan);
+        SetStatus((BooleanValue(data, "stale") ? "旧缓存 · " : "已同步 · ") + FormatActivity(TextValue(data, "generatedAt")), BooleanValue(data, "stale") ? amber : cyan);
         toolTip.SetToolTip(this, "拖动顶部移动 · 右上角可置顶或隐藏");
         Log("INFO", "用量刷新成功");
     }
@@ -1078,6 +1128,7 @@ internal sealed partial class TokenWidgetForm : Form
         var task = new UsageTask
         {
             Id = TextValue(item, "id"),
+            Revision = TextValue(item, "revision"),
             Label = TextValue(item, "label"),
             Title = TextValue(item, "title"),
             LastActivity = TextValue(item, "lastActivity"),
@@ -1155,7 +1206,7 @@ internal sealed partial class TokenWidgetForm : Form
 
     private UsageTurn FocusedTurn(UsageTask task)
     {
-        if (task == null || task.Turns.Count == 0) return null;
+        if (task == null || !task.DetailsLoaded || task.Turns.Count == 0) return null;
         focusedTurnIndex = Math.Max(0, Math.Min(focusedTurnIndex, task.Turns.Count - 1));
         return task.Turns[focusedTurnIndex];
     }
@@ -1172,10 +1223,10 @@ internal sealed partial class TokenWidgetForm : Form
     private void SetCompactDisplay(bool showTask)
     {
         var task = FocusedTask();
-        compactTaskMode = showTask && task != null && task.Turns.Count > 0;
+        compactTaskMode = showTask && task != null && task.TurnCount > 0;
         totalModeMenuItem.Checked = !compactTaskMode;
         taskModeMenuItem.Checked = compactTaskMode;
-        taskModeMenuItem.Enabled = task != null && task.Turns.Count > 0;
+        taskModeMenuItem.Enabled = task != null && task.TurnCount > 0;
         Invalidate();
     }
 
@@ -1219,14 +1270,19 @@ internal sealed partial class TokenWidgetForm : Form
         refreshTimer.Stop();
         trayIcon.Visible = false;
         trayIcon.Dispose();
+        refreshTimer.Dispose();
+        taskSearchTimer.Dispose();
+        toolTip.Dispose();
         StopOwnedServer();
         Log("INFO", "悬浮窗退出");
     }
 
     private void UpdateWindowRegion()
     {
+        var previousRegion = Region;
         using (var path = Rounded(new Rectangle(0, 0, Width, Height), compactMode ? 14 : 20))
             Region = new Region(path);
+        if (previousRegion != null) previousRegion.Dispose();
     }
 
     private static GraphicsPath Rounded(Rectangle rect, int radius)

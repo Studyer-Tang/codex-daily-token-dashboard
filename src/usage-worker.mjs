@@ -2,11 +2,15 @@ import { parentPort } from "node:worker_threads";
 
 import { collectUsage } from "./usage.mjs";
 
+import { selectUsageDetails } from "./usage-query.mjs";
+
 if (!parentPort) throw new Error("usage-worker must run inside a Worker");
 
-parentPort.on("message", async ({ id, days }) => {
+let queue = Promise.resolve();
+parentPort.on("message", ({ id, days, options = {} }) => {
+  queue = queue.then(async () => {
   try {
-    parentPort.postMessage({ id, usage: await collectUsage({ days }) });
+    parentPort.postMessage({ id, usage: selectUsageDetails(await collectUsage({ days, forceRefresh: options.forceRefresh }), options) });
   } catch (error) {
     parentPort.postMessage({
       id,
@@ -16,4 +20,5 @@ parentPort.on("message", async ({ id, days }) => {
       },
     });
   }
+  });
 });

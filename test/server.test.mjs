@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { createDashboardServer, selectUsageDetails, UsageWorkerClient } from "../server.mjs";
 
+const token = "a".repeat(64);
 const serverPath = fileURLToPath(new URL("../server.mjs", import.meta.url));
 
 async function listen(server) {
@@ -25,7 +26,7 @@ async function close(server) {
 
 function getJson(url, timeoutMilliseconds = 1_000) {
   return new Promise((resolve, reject) => {
-    const request = http.get(url, (response) => {
+    const request = http.get(url, { headers: { "X-Codex-Token": token } }, (response) => {
       let body = "";
       response.setEncoding("utf8");
       response.on("data", (chunk) => { body += chunk; });
@@ -66,7 +67,7 @@ test("health stays responsive while a usage request is still running", async () 
     request: () => new Promise((resolve) => { finishUsage = resolve; }),
     close: async () => {},
   };
-  const server = createDashboardServer({ usageClient, logger: { error() {} } });
+  const server = createDashboardServer({ authToken: token, usageClient, logger: { error() {} } });
   const origin = await listen(server);
   try {
     const usageRequest = getJson(`${origin}/api/usage?days=30`);
@@ -89,7 +90,7 @@ test("usage failures return a safe structured detail", async () => {
     request: async () => { throw new Error("synthetic scan failure"); },
     close: async () => {},
   };
-  const server = createDashboardServer({ usageClient, logger: { error() {} } });
+  const server = createDashboardServer({ authToken: token, usageClient, logger: { error() {} } });
   const origin = await listen(server);
   try {
     const response = await getJson(`${origin}/api/usage?days=30`);
@@ -109,7 +110,7 @@ test("API error details redact the user profile path", async () => {
     request: async () => { throw new Error(`${os.homedir()}\\private-rollout.jsonl failed`); },
     close: async () => {},
   };
-  const server = createDashboardServer({ usageClient, logger: { error() {} } });
+  const server = createDashboardServer({ authToken: token, usageClient, logger: { error() {} } });
   const origin = await listen(server);
   try {
     const payload = (await getJson(`${origin}/api/usage`)).body;

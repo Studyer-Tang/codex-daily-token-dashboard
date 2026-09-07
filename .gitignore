@@ -8,5 +8,7 @@ CodexTokenWidget.ci.exe
 CodexTokenWidget.exe
 dist/
 .release-staging/
+.release-staging-*/
+widget-build-*.exe
 .tmp-package-test/
 .package-smoke/

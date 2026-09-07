@@ -1,4 +1,7 @@
 import http from "node:http";
+import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto";
+import { applicationCacheDirectory } from "./src/usage.mjs";
+import { mkdir, writeFile, unlink } from "node:fs/promises";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -32,32 +35,11 @@ function safeErrorDetail(error) {
   return message.length > 240 ? `${message.slice(0, 239)}…` : message;
 }
 
-function taskMatchesQuery(task, query) {
-  const terms = String(query || "").trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
-  if (!terms.length) return true;
-  const prompts = Array.isArray(task?.turns) ? task.turns.map((turn) => turn?.prompt || "") : [];
-  const searchable = [task?.id, task?.label, task?.title, ...prompts].join(" ").toLocaleLowerCase();
-  return terms.every((term) => searchable.includes(term));
-}
-
-export function selectUsageDetails(usage, { taskDetail = "full", taskId = "", query = "" } = {}) {
-  if (!Array.isArray(usage?.tasks)) return usage;
-  if (taskId) {
-    return { ...usage, tasks: usage.tasks.filter((task) => task.id === taskId) };
-  }
-  const tasks = query ? usage.tasks.filter((task) => taskMatchesQuery(task, query)) : usage.tasks;
-  if (taskDetail === "summary") {
-    return {
-      ...usage,
-      tasks: tasks.map(({ turns = [], ...task }) => ({ ...task, turnCount: turns.length })),
-    };
-  }
-  return tasks === usage.tasks ? usage : { ...usage, tasks };
-}
+export { selectUsageDetails } from "./src/usage-query.mjs";
 
 export class UsageWorkerClient {
   constructor({
-    timeoutMilliseconds = 45_000,
+    timeoutMilliseconds = 180_000,
     workerUrl = new URL("./src/usage-worker.mjs", import.meta.url),
   } = {}) {
     this.timeoutMilliseconds = timeoutMilliseconds;
@@ -72,11 +54,11 @@ export class UsageWorkerClient {
     const worker = new Worker(this.workerUrl);
     this.worker = worker;
     worker.on("message", (message) => this.onMessage(message));
-    worker.on("error", (error) => this.failWorker(error));
+    worker.on("error", (error) => { if (this.worker === worker) this.failWorker(error); });
     worker.on("exit", (code) => {
       if (this.worker !== worker) return;
       this.worker = null;
-      if (code !== 0) this.rejectAll(new Error(`用量 Worker 意外退出，代码 ${code}`));
+      this.rejectAll(new Error(`用量 Worker 意外退出，代码 ${code}`));
     });
     return worker;
   }
@@ -110,7 +92,8 @@ export class UsageWorkerClient {
     worker?.terminate().catch(() => {});
   }
 
-  request(days) {
+  request(days, options = {}) {
+    if (this.pending.size >= 32) return Promise.reject(new Error("统计请求过多，请稍后重试"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -119,7 +102,8 @@ export class UsageWorkerClient {
         this.failWorker(new Error("用量 Worker 已因超时重置"));
       }, this.timeoutMilliseconds);
       this.pending.set(id, { resolve, reject, timer });
-      this.ensureWorker().postMessage({ id, days });
+      try { this.ensureWorker().postMessage({ id, days, options }); }
+      catch (error) { this.failWorker(error); }
     });
   }
 
@@ -135,41 +119,72 @@ export function createDashboardServer({
   publicRoot = defaultPublicRoot,
   usageClient = new UsageWorkerClient(),
   logger = console,
+  authToken = process.env.CODEX_TOKEN_AUTH_TOKEN || randomBytes(32).toString("hex"),
+  instanceId = randomUUID(),
+  onShutdown = null,
 } = {}) {
+  if (!/^[a-f0-9]{64}$/i.test(authToken)) throw new Error("Invalid service token");
+  const authenticated = (request) => {
+    const token = String(request.headers["x-codex-token"] || "");
+    return /^[a-f0-9]{64}$/i.test(token) && timingSafeEqual(Buffer.from(token), Buffer.from(authToken));
+  };
   const server = http.createServer(async (request, response) => {
     try {
       const address = server.address();
       const localPort = typeof address === "object" && address ? address.port : 4817;
-      const url = new URL(request.url || "/", `http://${host}:${localPort}`);
+      const authority = request.headers.host;
+      if (![host + ":" + localPort, "localhost:" + localPort].includes(authority) ||
+          (request.headers.origin && request.headers.origin !== "http://" + authority) ||
+          (request.headers["sec-fetch-site"] && !["same-origin", "none"].includes(request.headers["sec-fetch-site"])) ||
+          !request.url?.startsWith("/") || request.url.startsWith("//")) {
+        return sendJson(response, 403, { error: "Forbidden origin or host" });
+      }
+      const url = new URL(request.url, "http://" + authority);
+      if (url.pathname === "/api/shutdown") {
+        if (request.method !== "POST") return sendJson(response, 405, { error: "POST required" });
+        if (!authenticated(request)) return sendJson(response, 401, { error: "Authentication required" });
+        if (!onShutdown) return sendJson(response, 409, { error: "请从悬浮窗托盘退出此服务" });
+        sendJson(response, 200, { ok: true });
+        setImmediate(onShutdown);
+        return;
+      }
+      if (request.method !== "GET") return sendJson(response, 405, { error: "GET required" });
       if (url.pathname === "/api/health") {
         return sendJson(response, 200, {
           ok: true,
+          authorized: authenticated(request),
+          instanceId,
           service: "codex-daily-token-dashboard",
           worker: usageClient.worker ? "ready" : "idle",
         });
       }
       if (url.pathname === "/api/usage") {
-        const days = Math.max(7, Math.min(365, Number(url.searchParams.get("days")) || 30));
-        const usage = await usageClient.request(days);
-        return sendJson(response, 200, selectUsageDetails(usage, {
-          taskDetail: url.searchParams.get("taskDetail") || "full",
+        if (!authenticated(request)) return sendJson(response, 401, { error: "Authentication required" });
+        const days = Math.max(7, Math.min(365, Math.floor(Number(url.searchParams.get("days"))) || 30));
+        const options = {
+          taskDetail: url.searchParams.get("taskDetail") || "summary",
           taskId: url.searchParams.get("task") || "",
           query: (url.searchParams.get("query") || "").slice(0, 80),
-        }));
+          revision: url.searchParams.get("revision") || "",
+          forceRefresh: url.searchParams.get("forceRefresh") === "1",
+        };
+        for (const key of ["taskOffset", "taskLimit", "turnOffset", "turnLimit"]) options[key] = Number(url.searchParams.get(key)) || 0;
+        return sendJson(response, 200, await usageClient.request(days, options));
       }
       const asset = staticFiles.get(url.pathname);
       if (!asset) return sendJson(response, 404, { error: "Not found" });
       const [fileName, contentType] = asset;
-      const content = await readFile(path.join(publicRoot, fileName));
+      let content = await readFile(path.join(publicRoot, fileName));
+      if (fileName === "index.html") content = content.toString("utf8").replace("</head>", '<meta name="dashboard-token" content="' + authToken + '"></head>');
       response.writeHead(200, {
         "content-type": contentType,
-        "cache-control": fileName === "index.html" ? "no-cache" : "public, max-age=3600",
+        "cache-control": fileName === "index.html" ? "no-store" : "public, max-age=3600",
         "x-content-type-options": "nosniff",
         "content-security-policy": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
       });
       response.end(content);
     } catch (error) {
-      logger.error(error);
+      logger.error(safeErrorDetail(error));
       if (!response.headersSent) {
         sendJson(response, 500, {
           error: "读取本地 Codex 用量失败",
@@ -190,39 +205,49 @@ function isDirectRun() {
 }
 
 if (isDirectRun()) {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  if (major < 22 || (major === 22 && minor < 13)) throw new Error("Node.js 22.13 or newer is required");
   const requestedPort = Number(process.env.CODEX_TOKEN_PORT || 4817);
-  const port = Number.isInteger(requestedPort) && requestedPort >= 0 ? requestedPort : 4817;
-  const server = createDashboardServer();
-  let parentTimer = null;
-
-  server.on("error", (error) => {
-    console.error(error.code === "EADDRINUSE" ? `端口 ${port} 已被其他程序占用` : error);
+  const port = Number.isInteger(requestedPort) && requestedPort >= 0 && requestedPort <= 65535 ? requestedPort : 4817;
+  const authToken = process.env.CODEX_TOKEN_AUTH_TOKEN || randomBytes(32).toString("hex");
+  const instanceId = randomUUID();
+  const parentPid = Number(process.env.CODEX_TOKEN_PARENT_PID) || 0;
+  const registryFile = path.join(applicationCacheDirectory(), "servers", process.pid + ".json");
+  let parentTimer, closing = false;
+  let registration = Promise.resolve();
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    clearInterval(parentTimer);
+    const deadline = setTimeout(() => process.exit(0), 2500);
+    deadline.unref();
+    server.close(async () => {
+      await registration;
+      await unlink(registryFile).catch(() => {});
+      process.exit(0);
+    });
+    server.closeAllConnections();
+  };
+  const server = createDashboardServer({ authToken, instanceId, onShutdown: parentPid ? null : shutdown });
+  server.on("error", error => {
+    console.error(error.code === "EADDRINUSE" ? `端口 ${port} 已被其他程序占用` : safeErrorDetail(error));
     process.exitCode = 1;
   });
   server.listen(port, host, () => {
-    const address = server.address();
-    const actualPort = typeof address === "object" && address ? address.port : port;
+    const actualPort = server.address().port;
+    registration = (async () => {
+      await mkdir(path.dirname(registryFile), { recursive: true });
+      await writeFile(registryFile, JSON.stringify({ pid: process.pid, port: actualPort, token: authToken,
+        instanceId, serverPath: fileURLToPath(import.meta.url), parentPid }), { mode: 0o600 });
+    })().catch(() => console.error("无法写入服务登记文件，请在启动终端停止服务"));
     console.log(`Codex 每日 Token 仪表盘：http://${host}:${actualPort}`);
-    console.log("数据只从本机 .codex 会话日志读取，不会上传。按 Ctrl+C 停止。 ");
+    console.log("数据仅在本机处理，不会上传。按 Ctrl+C 停止。");
   });
-
-  const parentPid = Number(process.env.CODEX_TOKEN_PARENT_PID);
   if (Number.isInteger(parentPid) && parentPid > 0) {
     parentTimer = setInterval(() => {
-      try {
-        process.kill(parentPid, 0);
-      } catch {
-        console.error(`父进程 ${parentPid} 已退出，本地统计服务同步关闭`);
-        server.close(() => process.exit(0));
-      }
-    }, 2_000);
+      try { process.kill(parentPid, 0); } catch { shutdown(); }
+    }, 2000);
     parentTimer.unref();
   }
-
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.on(signal, () => {
-      if (parentTimer) clearInterval(parentTimer);
-      server.close(() => process.exit(0));
-    });
-  }
+  for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, shutdown);
 }

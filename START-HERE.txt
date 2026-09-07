@@ -10,5 +10,10 @@ Codex Token Widget / 使用说明
 
 所有数据只从本机 .codex 目录读取。退出请右键系统托盘图标并选择“退出”。
 
+1.6.0：修复跨日统计、重复计数、任务详情不更新与停止脚本误杀风险。
+首次读取大量历史可能需要约一分钟；后续仅增量读取。出现“旧缓存”表示刷新未成功。
+任务标题及用户提示词摘要会保存在本机缓存中，请勿将缓存当作已脱敏数据分享。
+stop-dashboard.cmd 仅关闭独立网页服务；悬浮窗服务请从托盘退出。
+
 English: Extract the whole folder and double-click CodexTokenWidget.exe.
 The package is self-contained and requires no server address or configuration.
